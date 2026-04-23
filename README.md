@@ -82,6 +82,7 @@ quickbox-gui
 ## Configuration
 
 Config stored in ~/.config/quickbox/quickbox-gui.conf
+
 Default VM directory: ~/emu/
 
 ## Files
