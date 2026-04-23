@@ -85,15 +85,6 @@ Config stored in ~/.config/quickbox/quickbox-gui.conf
 
 Default VM directory: ~/emu/
 
-## Files
-
-- quickbox-gui: Main Python application
-- quickbox-launch: Bash wrapper enables Alt-F2 launcher support (runs python3 quickbox-gui)
-- quickbox-gui.desktop: Desktop integration
-- install.sh: Installation script
-- uninstall.sh: Uninstallation script
-- LICENSE: MIT License
-
 ## License
 
 MIT - Copyright (c) 2026 Musqz
