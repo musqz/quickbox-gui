@@ -16,6 +16,10 @@ I think when it is tested for longer I would say it is stable.
 
 Note: The SSH part is mostly a helping hand with some oneliners and setting up the sshd (daemon).
 
+![advanced](images/advanced.jpg)
+
+![quickget](images/quickget.jpg)
+
 ## Requirements
 
 - Python 3.6+
