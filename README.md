@@ -4,17 +4,25 @@ GTK3-based GUI for managing QEMU virtual machines with quickemu integration.
 
 ## Features
 
-VM creation, deletion, start/stop, SSH port management, snapshots, migration, cloning, ISO management, 
-
-boot order control, UEFI/BIOS support, distro updates. 
-
-Quickget to get the latest updated distro's. In GUI a refresh button.
+VM creation, deletion, start/stop, SSH port management, snapshots, migration, cloning, ISO management, boot order control, UEFI/BIOS support, distro updates. Quickget to get the latest updated distro's. In GUI a refresh button.
 
 ## Disclaimer
 
-I think when it is tested for longer I would say it is stable. 
+    **DEVELOPMENT / TESTING PHASE - USE AT OWN RISK**
 
-Note: The SSH part is mostly a helping hand with some oneliners and setting up the sshd (daemon).
+    This tool is in active development and testing phase.
+
+    Status: Tested for approximately 3 weeks. Overall feels stable.
+
+    Known behavior:
+    - Most distros from quickget --list work fine
+    - Some distros (e.g. EasyOS) may fail
+    - SSH part is a helper tool with basic oneliners and sshd setup - not production-grade
+    - Configuration may need adjustments for edge cases
+
+    Tested successfully with: Ubuntu, Debian, Arch, AlmaLinux, Manjaro and others from quickget list.
+
+    Report issues if you encounter problems. Feedback helps improve stability.
 
 ![advanced](images/advanced.jpg)
 
@@ -30,46 +38,45 @@ Note: The SSH part is mostly a helping hand with some oneliners and setting up t
 
 Easiest method using install script:
 
-```
-    sudo ./install.sh
+```bash
+sudo ./install.sh
 ```
 
 Manual installation as root:
 
-```
-    sudo cp quickbox-gui /usr/local/bin/
-    sudo chmod +x /usr/local/bin/quickbox-gui
-    sudo cp quickbox-gui.desktop /usr/share/applications/
+```bash
+sudo cp quickbox-gui /usr/local/bin/
+sudo chmod +x /usr/local/bin/quickbox-gui
+sudo cp quickbox-gui.desktop /usr/share/applications/
 ```
 
 Optional - Alt-F2 launcher support:
 
-```
-    sudo cp quickbox-launch /usr/local/bin/
-    sudo chmod +x /usr/local/bin/quickbox-launch
+```bash
+sudo cp quickbox-launch /usr/local/bin/
+sudo chmod +x /usr/local/bin/quickbox-launch
 ```
 
 ## Uninstallation
 
-```
-    sudo ./uninstall.sh
+```bash
+sudo ./uninstall.sh
 ```
 
 Or manually remove:
 
-
-```
-    sudo rm /usr/local/bin/quickbox-gui
-    sudo rm /usr/local/bin/quickbox-launch (if installed)
-    sudo rm /usr/share/applications/quickbox-gui.desktop
+```bash
+sudo rm /usr/local/bin/quickbox-gui
+sudo rm /usr/local/bin/quickbox-launch (if installed)
+sudo rm /usr/share/applications/quickbox-gui.desktop
 ```
 
 ## Usage
 
 Command line:
 
-```
-    quickbox-gui
+```bash
+quickbox-gui
 ```
 
 ## Configuration
