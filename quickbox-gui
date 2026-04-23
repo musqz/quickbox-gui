@@ -1,0 +1,2473 @@
+#!/usr/bin/env python3
+# quickbox-gui - GTK3 GUI / quickemu VM manager
+# Author: musqz
+# License: GPL3
+# 
+# FIXES (boot/reboot v2):
+# - Removed _disk_has_efi() heuristic (unreliable)
+# - OVMF_VARS created once, never reset (persists bootloader registration)
+# - Added -boot order=d for UEFI+ISO (forces CDROM priority during install)
+# - Split _launch_vm() into 3 clear paths:
+#   A) ISO+Disk (install phase)
+#   B) Disk only (post-install phase)
+#   C) Special modes (legacy, raw IMG, EasyOS)
+
+# ─── SINGLE INSTANCE LOCK (MUST BE FIRST!) ────────────────────────────────────
+import socket
+import sys
+from pathlib import Path
+
+SOCKET_PATH = Path.home() / ".config/quickbox/quickbox-gui.sock"
+
+def _acquire_lock():
+    """Acquire exclusive socket lock - BEFORE anything else runs"""
+    SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        SOCKET_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(str(SOCKET_PATH))
+        return sock
+    except OSError:
+        # Another process has the lock!
+        try:
+            import subprocess
+            subprocess.run(["notify-send", "-u", "normal", "Quickbox", 
+                          "ERROR: GUI is already running!"], timeout=5)
+        except Exception:
+            pass
+        print("ERROR: Quickbox GUI is already running!", file=sys.stderr)
+        sys.exit(1)
+
+# ACQUIRE LOCK IMMEDIATELY - BEFORE GTK!
+_lock_socket = _acquire_lock()
+
+# ────────────────────────────────────────────────────────────────────────────────
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GLib, Pango, Gdk
+
+import os
+import subprocess
+import glob
+import shutil
+import threading
+from pathlib import Path
+
+CONFIG_FILE   = Path.home() / ".config/quickbox/quickbox-gui.conf"
+ICON_PATH     = next((p for p in [
+    Path("/usr/share/icons/hicolor/scalable/apps/quickbox.svg"),
+    Path("/usr/share/icons/hicolor/scalable/apps/utilities-terminal.svg"),
+    Path("/usr/share/icons/Papirus/48x48/apps/qemu.svg"),
+    Path("/usr/share/icons/hicolor/48x48/apps/qemu.png"),
+    Path("/usr/share/pixmaps/qemu.png"),
+] if p.exists()), None)
+FALLBACK_ICON = "computer-vm"  # generic GTK icon name
+
+# ensure config dir exists
+CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# detect KVM availability once at startup
+KVM_AVAILABLE = Path("/dev/kvm").exists() and os.access("/dev/kvm", os.R_OK | os.W_OK)
+
+# OVMF firmware paths — try common locations
+OVMF_CODE = next((p for p in [
+    Path("/usr/share/edk2/x64/OVMF_CODE.4m.fd"),
+    Path("/usr/share/OVMF/OVMF_CODE.fd"),
+    Path("/usr/share/qemu/OVMF.fd"),
+] if p.exists()), None)
+
+OVMF_VARS_TEMPLATE = next((p for p in [
+    Path("/usr/share/edk2/x64/OVMF_VARS.4m.fd"),
+    Path("/usr/share/OVMF/OVMF_VARS.fd"),
+] if p.exists()), None)
+
+
+# ─── helpers ──────────────────────────────────────────────────────────────────
+
+def notify(title, body, urgency="low"):
+    icon = str(ICON_PATH) if ICON_PATH else FALLBACK_ICON
+    subprocess.Popen(["notify-send", "-i", icon, "-u", urgency, title, body])
+
+
+def read_conf():
+    conf = {}
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                conf[k.strip()] = v.strip().strip('"')
+    conf.setdefault("vms_dir", str(Path.home() / "emu"))
+    return conf
+
+
+def setconf(key, value, filepath=None):
+    """Safe conf writer - handles paths with slashes."""
+    fp = Path(filepath) if filepath else CONFIG_FILE
+    content = fp.read_text() if fp.exists() else ""
+    lines = content.splitlines()
+    updated = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}"
+            updated = True
+            break
+    if not updated:
+        lines.append(f"{key}={value}")
+    fp.write_text("\n".join(lines) + "\n")
+
+
+def remove_key(key, filepath):
+    fp = Path(filepath)
+    if not fp.exists():
+        return
+    lines = [l for l in fp.read_text().splitlines() if not l.startswith(f"{key}=")]
+    fp.write_text("\n".join(lines) + "\n")
+
+
+def read_vm_conf(path):
+    vm = {}
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                vm[k.strip()] = v.strip().strip('"')
+    except Exception:
+        pass
+    return vm
+
+
+def is_running(vmname):
+    r = subprocess.run(["pgrep", "-f", f"name {vmname},process={vmname}"],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+def dir_size(path):
+    try:
+        r = subprocess.run(["du", "-sh", path], capture_output=True, text=True)
+        return r.stdout.split()[0] if r.stdout.strip() else "?"
+    except Exception:
+        return "?"
+
+
+def get_snapshots(disk_path):
+    snaps = []
+    try:
+        r = subprocess.run(["qemu-img", "snapshot", "-l", disk_path],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines()[2:]:
+            parts = line.split()
+            if len(parts) >= 2:
+                snaps.append({"id": parts[0], "tag": parts[1]})
+    except Exception:
+        pass
+    return snaps
+
+
+def get_vms(vms_dir):
+    vms = []
+    for conf_path in sorted(glob.glob(f"{vms_dir}/*.conf")):
+        vm = read_vm_conf(conf_path)
+        vm["_conf"]    = conf_path
+        vm["_name"]    = Path(conf_path).stem
+        vm["_pretty"]  = vm.get("pretty", vm["_name"])
+        vm["_running"] = is_running(vm["_name"])
+        disk = vm.get("disk_img", "")
+        vm["_disk"]    = str(Path(vms_dir) / disk) if disk else ""
+        vm["_has_disk"] = Path(vm["_disk"]).exists() if vm["_disk"] else False
+        vm["_size"]    = dir_size(str(Path(vms_dir) / vm["_name"]))
+        vms.append(vm)
+    return vms
+
+
+# ─── SSH helpers ──────────────────────────────────────────────────────────────
+
+def get_ssh_user(guest_os):
+    """Auto-detect SSH user by distro."""
+    guest_os = guest_os.lower()
+    if any(x in guest_os for x in ["ubuntu", "debian", "mint", "elementary"]):
+        return "ubuntu"
+    return "root"
+
+
+def get_next_ssh_port(vms_dir, vmname):
+    """Assign unique SSH port 2222-2299 per VM, stored in .conf."""
+    vms = get_vms(vms_dir)
+    used_ports = set()
+    for vm in vms:
+        if vm["_name"] != vmname:
+            port = vm.get("ssh_port", "")
+            if port:
+                try:
+                    used_ports.add(int(port))
+                except ValueError:
+                    pass
+    for port in range(2222, 2300):
+        if port not in used_ports:
+            return str(port)
+    return "2222"
+
+
+# ─── VM list row ──────────────────────────────────────────────────────────────
+
+class VMRow(Gtk.ListBoxRow):
+    def __init__(self, vm):
+        super().__init__()
+        self.vm = vm
+        self.set_margin_top(2)
+        self.set_margin_bottom(2)
+        self.set_margin_start(4)
+        self.set_margin_end(4)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        box.set_margin_top(7)
+        box.set_margin_bottom(7)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+
+        dot = Gtk.Label()
+        if vm["_running"]:
+            dot.set_markup('<span color="#4caf50" size="large">●</span>')
+        elif vm["_has_disk"]:
+            dot.set_markup('<span color="#888" size="large">●</span>')
+        else:
+            dot.set_markup('<span color="#ff9800" size="large">●</span>')
+        box.pack_start(dot, False, False, 0)
+
+        name = Gtk.Label(label=vm["_pretty"])
+        name.set_halign(Gtk.Align.START)
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        name.set_max_width_chars(22)
+        box.pack_start(name, True, True, 0)
+
+        if vm["_running"]:
+            badge = Gtk.Label(label="running")
+            badge.get_style_context().add_class("badge-running")
+            box.pack_end(badge, False, False, 0)
+        else:
+            sz = Gtk.Label(label=vm["_size"])
+            sz.get_style_context().add_class("dim-label")
+            box.pack_end(sz, False, False, 0)
+
+        self.add(box)
+        self.show_all()
+
+
+# ─── main window ──────────────────────────────────────────────────────────────
+
+class QuickboxWindow(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Quickbox")
+        self.set_default_size(960, 640)
+        self.set_resizable(True)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        # set window icon from theme or file
+        if ICON_PATH:
+            self.set_icon_from_file(str(ICON_PATH))
+        else:
+            self.set_icon_name("computer-vm")
+        self.conf      = read_conf()
+        self.vms_dir   = self.conf.get("vms_dir", str(Path.home() / "emu"))
+        self.current_vm = None
+        self._search_text = ""
+        self._vms_dir_mtime = 0
+        self._ssh_help_win = None
+        self._timeout_handlers = []  # Track timeout IDs
+        self._build_css()
+        self._build_ui()
+        self._refresh()
+        self.connect("delete-event", self._on_delete)
+        # poll VM running state and vms_dir changes every 4 seconds
+        self._timeout_handlers.append(GLib.timeout_add(4000, self._poll_running_state))
+        self._timeout_handlers.append(GLib.timeout_add(4000, self._poll_vms_dir))
+        # poll copying progress every 2 seconds
+        self._timeout_handlers.append(GLib.timeout_add(2000, self._poll_copying))
+
+    def _on_delete(self, widget, event):
+        """Handle window close event - clean exit."""
+        # Remove all timeout handlers
+        for timeout_id in self._timeout_handlers:
+            GLib.source_remove(timeout_id)
+        self._timeout_handlers.clear()
+        
+        # Close help window if open
+        if self._ssh_help_win and self._ssh_help_win.get_visible():
+            self._ssh_help_win.destroy()
+        
+        # Exit immediately
+        import sys
+        sys.exit(0)
+
+    def _poll_running_state(self):
+        """Check if any VM's running state changed - refresh only if so."""
+        changed = False
+        for row in self.listbox.get_children():
+            if not hasattr(row, "vm"):
+                continue
+            was_running = row.vm.get("_running", False)
+            now_running = is_running(row.vm["_name"])
+            if was_running != now_running:
+                changed = True
+                break
+        if changed:
+            self._refresh()
+        return True  # keep firing
+
+    def _poll_copying(self):
+        """Refresh every 2 seconds while a clone copy is in progress."""
+        try:
+            if list(Path(self.vms_dir).glob(".*.copying")):
+                self._refresh()
+        except Exception:
+            pass
+        return True
+
+    def _poll_vms_dir(self):
+        """Watch vms_dir for new/removed VMs and completed copies."""
+        try:
+            mtime = os.stat(self.vms_dir).st_mtime
+            if mtime != self._vms_dir_mtime:
+                if self._vms_dir_mtime != 0:
+                    self._refresh()
+                    # if current VM was copying, re-show its panel
+                    if self.current_vm:
+                        self._show_panel(self.current_vm)
+                self._vms_dir_mtime = mtime
+        except Exception:
+            pass
+        return True
+
+    # ── CSS ──
+
+    def _build_css(self):
+        css = b"""
+        .vm-listbox row { border-radius:6px; margin:2px 4px; }
+        .vm-listbox row:selected { background-color:alpha(@theme_selected_bg_color,0.8); }
+        .vm-listbox row:hover    { background-color:alpha(@theme_selected_bg_color,0.25); }
+        .badge-running { background-color:#2e7d32; color:white;
+                         border-radius:4px; padding:1px 6px; font-size:11px; }
+        .section-hdr { font-weight:bold; font-size:11px;
+                       color:alpha(@theme_fg_color,0.55);
+                       margin-top:14px; margin-bottom:2px; }
+        .launch-btn { background-color:#1565c0; color:white;
+                      border-radius:6px; padding:7px 18px;
+                      font-size:13px; font-weight:bold; }
+        .launch-btn:hover { background-color:#1976d2; }
+        .danger-btn { color:#c62828; }
+        .ssh-btn { background-color:#455a64; color:white;
+                   border-radius:4px; padding:6px 12px; }
+        .ssh-btn:hover { background-color:#546e7a; }
+        """
+        p = Gtk.CssProvider()
+        p.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), p,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    # ── UI skeleton ──
+
+    def _build_ui(self):
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(vbox)
+
+        # HeaderBar
+        hb = Gtk.HeaderBar()
+        hb.set_show_close_button(True)
+        hb.set_title("Quickbox")
+        hb.set_subtitle(self.vms_dir)
+        self.set_titlebar(hb)
+        self._headerbar = hb
+
+        refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
+        refresh_btn.set_tooltip_text("Refresh")
+        refresh_btn.connect("clicked", lambda b: self._refresh())
+        hb.pack_start(refresh_btn)
+
+        ssh_menu_btn = Gtk.MenuButton()
+        ssh_menu_btn.set_label("SSH")
+        ssh_menu_btn.set_tooltip_text("Quick SSH access to running VMs")
+        self._ssh_menu = Gtk.Menu()
+        ssh_menu_btn.set_popup(self._ssh_menu)
+        hb.pack_start(ssh_menu_btn)
+        self._ssh_menu_btn = ssh_menu_btn
+
+        quick_ref_btn = Gtk.MenuButton()
+        quick_ref_btn.set_label("Quick Ref")
+        quick_ref_btn.set_tooltip_text("SSH/SCP command quick reference")
+        self._quick_ref_menu = Gtk.Menu()
+        quick_ref_btn.set_popup(self._quick_ref_menu)
+        hb.pack_start(quick_ref_btn)
+        self._build_quick_ref_menu()
+
+        help_btn = Gtk.Button.new_from_icon_name("help-browser-symbolic", Gtk.IconSize.BUTTON)
+        help_btn.set_tooltip_text("SSH Setup & Commands Help")
+        help_btn.connect("clicked", lambda b: self._show_ssh_help())
+        hb.pack_start(help_btn)
+
+
+
+
+        for label, icon, tooltip, cb in [
+            ("Download",  "folder-download-symbolic", "Download a new distro ISO via quickget", self._dlg_download),
+            ("Custom VM", "list-add-symbolic",        "Create a VM from a local ISO or IMG file", self._dlg_custom),
+            ("Advanced",  "preferences-system-symbolic", "Migrate VMs, switch location, manage saved paths", self._dlg_advanced),
+        ]:
+            btn = Gtk.Button(label=f"  {label}")
+            btn.set_image(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
+            btn.set_always_show_image(True)
+            btn.set_tooltip_text(tooltip)
+            btn.connect("clicked", cb)
+            hb.pack_end(btn)
+
+        # Paned
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(280)
+        paned.set_sensitive(True)
+        # prevent user from dragging the divider
+        paned.set_property("position-set", True)
+        vbox.pack_start(paned, True, True, 0)
+
+        # Left — list
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        search = Gtk.SearchEntry()
+        search.set_placeholder_text("Filter VMs…")
+        search.set_tooltip_text("Type to filter the VM list by name")
+        search.set_margin_top(8); search.set_margin_bottom(4)
+        search.set_margin_start(8); search.set_margin_end(8)
+        search.connect("search-changed", self._on_search)
+        left.pack_start(search, False, False, 0)
+
+        scroll_l = Gtk.ScrolledWindow()
+        scroll_l.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.listbox = Gtk.ListBox()
+        self.listbox.get_style_context().add_class("vm-listbox")
+        self.listbox.set_filter_func(self._filter)
+        self.listbox.connect("row-selected", self._on_select)
+        scroll_l.add(self.listbox)
+        left.pack_start(scroll_l, True, True, 0)
+        paned.pack1(left, False, False)
+
+        # Right — detail scroll
+        self.right_scroll = Gtk.ScrolledWindow()
+        self.right_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.right_box.set_margin_top(16); self.right_box.set_margin_bottom(16)
+        self.right_box.set_margin_start(20); self.right_box.set_margin_end(20)
+        self.right_scroll.add(self.right_box)
+        paned.pack2(self.right_scroll, True, False)
+        self._show_welcome()
+
+        # Status bar
+        sb = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        sb.get_style_context().add_class("statusbar")
+        sb.set_margin_start(12); sb.set_margin_end(12)
+        sb.set_margin_top(4);    sb.set_margin_bottom(4)
+        self._status = Gtk.Label()
+        self._status.set_halign(Gtk.Align.START)
+        sb.pack_start(self._status, True, True, 0)
+        vbox.pack_end(sb, False, False, 0)
+
+    # ── refresh ──
+
+    def _refresh(self):
+        for row in self.listbox.get_children():
+            self.listbox.remove(row)
+        self.vms = get_vms(self.vms_dir)
+        for vm in self.vms:
+            self.listbox.add(VMRow(vm))
+        self.listbox.show_all()
+        n = len(self.vms)
+        self._status.set_markup(
+            f'<span size="small">{self.vms_dir}  •  {n} VM{"s" if n != 1 else ""}</span>')
+        self._headerbar.set_subtitle(self.vms_dir)
+        # re-select
+        if self.current_vm:
+            name = self.current_vm["_name"]
+            for row in self.listbox.get_children():
+                if hasattr(row, "vm") and row.vm["_name"] == name:
+                    self.listbox.select_row(row)
+                    self.current_vm = row.vm
+                    break
+        self._refresh_ssh_menu()
+        return False  # stop GLib.timeout_add
+
+    # ── list helpers ──
+
+    def _on_search(self, entry):
+        self._search_text = entry.get_text().lower()
+        self.listbox.invalidate_filter()
+
+    def _filter(self, row):
+        if not self._search_text:
+            return True
+        return (self._search_text in row.vm["_pretty"].lower() or
+                self._search_text in row.vm["_name"].lower())
+
+    def _show_ssh_help(self):
+        """Toggle SSH help window - show/hide."""
+        if self._ssh_help_win is not None:
+            if self._ssh_help_win.get_visible():
+                self._ssh_help_win.hide()
+                return
+            else:
+                self._ssh_help_win.show_all()
+                self._ssh_help_win.present()
+                return
+        
+        help_win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        help_win.set_title("SSH Setup & Commands")
+        help_win.set_default_size(600, 500)
+        help_win.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        help_win.set_keep_above(True)  # Always on top
+        help_win.connect("delete-event", lambda w, e: self._on_help_closed())
+        
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        help_win.add(vbox)
+        
+        # Notebook with two tabs
+        notebook = Gtk.Notebook()
+        vbox.pack_start(notebook, True, True, 0)
+        
+        # ─── TAB 1: Quick Setup ───
+        setup_scroll = Gtk.ScrolledWindow()
+        setup_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        setup_text = Gtk.TextView()
+        setup_text.set_editable(False)
+        setup_text.set_wrap_mode(Gtk.WrapMode.WORD)
+        setup_buffer = setup_text.get_buffer()
+        
+        setup_content = """SSH SETUP FOR GUEST VM
+
+1. EDIT /etc/ssh/sshd_config
+
+   sudo nano /etc/ssh/sshd_config
+   
+   Ensure these lines are present and uncommented:
+   ===============================================================
+   Port 22
+   PermitRootLogin yes
+   PasswordAuthentication yes
+   PubkeyAuthentication yes
+   ===============================================================
+   
+   Note: SSH is case-sensitive. Use exact capitalization shown above.
+   After editing, validate with: sudo sshd -t
+
+2. RESTART SSH SERVICE
+
+   sudo systemctl restart sshd.service
+   sudo systemctl enable sshd.service
+
+3. VERIFY SSH IS ACTUALLY LISTENING
+
+   CRITICAL: Check if sshd is listening on port 22 in the guest:
+   -------------------------------------------
+   sudo ss -tlnp | grep :22
+   
+   You should see output like:
+   LISTEN  0  128  0.0.0.0:22  0.0.0.0:*  pid/sshd
+   
+   If NO output -> sshd is NOT listening. Fix it before trying SSH.
+
+4. TROUBLESHOOT "CONNECTION REFUSED"
+
+   This means quickbox CANNOT reach SSH on the forwarded port.
+   
+   Step A: Is sshd actually running in guest?
+   -------------------------------------------
+   sudo systemctl status sshd
+   sudo ss -tlnp | grep :22
+   
+   If not listening:
+   - sudo sshd -t          (check for config errors)
+   - sudo systemctl restart sshd
+   - sudo journalctl -u sshd -n 20  (view logs)
+
+   Step B: Is guest firewall blocking port 22?
+   -------------------------------------------
+   sudo iptables -L -n | grep 22
+   sudo ufw status
+   
+   If blocked, open SSH:
+   sudo ufw allow 22/tcp
+   sudo firewall-cmd --add-service=ssh --permanent
+
+   Step C: Verify quickbox port forwarding
+   -------------------------------------------
+   From HOST terminal (not guest), test if port is forwarded:
+   
+   telnet localhost 2222
+   
+   If it connects, type: quit
+   If "Connection refused" -> QEMU forwarding is misconfigured
+   
+   Check quickbox configuration for -netdev flags
+
+5. TEST FROM HOST
+
+   Once sshd is confirmed listening in guest:
+   
+   ssh -v -p 2222 root@localhost
+   
+   The -v flag shows connection details to help debug
+   any remaining issues
+"""
+        
+        setup_buffer.set_text(setup_content)
+        setup_scroll.add(setup_text)
+        notebook.append_page(setup_scroll, Gtk.Label(label="Setup"))
+        
+        # ─── TAB 2: Quick Commands ───
+        cmd_scroll = Gtk.ScrolledWindow()
+        cmd_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        cmd_text = Gtk.TextView()
+        cmd_text.set_editable(False)
+        cmd_text.set_wrap_mode(Gtk.WrapMode.WORD)
+        cmd_text.set_monospace(True)
+        cmd_buffer = cmd_text.get_buffer()
+        
+        cmd_content = """SSH/SCP QUICK COMMANDS
+
+Replace: PORT with actual port (2222, 2223, etc)
+         USER with ssh_user (root, ubuntu, etc)
+
+INTERACTIVE SHELL
+-------------------------------------------
+ssh -p PORT USER@localhost
+ssh -p 2222 root@localhost
+
+
+PULL FILES FROM VM TO HOST
+-------------------------------------------
+# Single file:
+scp -P PORT USER@localhost:/remote/path/file /local/path/
+
+# Example:
+scp -P 2222 root@localhost:/etc/ssh/sshd_config ~/backup/
+
+# Directory:
+scp -P PORT -r USER@localhost:/remote/dir /local/path/
+
+
+PUSH FILES FROM HOST TO VM
+-------------------------------------------
+# Single file:
+scp -P PORT /local/file USER@localhost:/remote/path/
+
+# Example:
+scp -P 2222 ~/my-file.txt root@localhost:/home/
+
+# Directory:
+scp -P PORT -r /local/dir USER@localhost:/remote/path/
+
+
+RUN COMMAND (NO SHELL)
+-------------------------------------------
+ssh -p PORT USER@localhost 'ls -la /home/'
+ssh -p 2222 root@localhost 'systemctl status sshd'
+
+View file without copying:
+ssh -p PORT USER@localhost 'cat /etc/ssh/sshd_config'
+
+
+TIPS
+-------------------------------------------
+* Use -P (capital) for port in scp
+* Use -p (lowercase) for port in ssh
+* Add -r flag to scp for directories
+* Use -C flag to compress transfers
+* Check quickbox SSH menu for exact ports
+"""
+        
+        cmd_buffer.set_text(cmd_content)
+        cmd_scroll.add(cmd_text)
+        notebook.append_page(cmd_scroll, Gtk.Label(label="Commands"))
+        
+        # Store window reference
+        self._ssh_help_win = help_win
+        
+        # Close button
+        close_btn = Gtk.Button(label="Close")
+        close_btn.connect("clicked", lambda b: help_win.hide())
+        vbox.pack_end(close_btn, False, False, 8)
+        close_btn.set_margin_start(8)
+        close_btn.set_margin_end(8)
+        close_btn.set_margin_bottom(8)
+        
+        help_win.show_all()
+
+
+    def _on_help_closed(self):
+        """Handle help window close button."""
+        self._ssh_help_win = None
+        return False  # Allow window to close
+
+    def _build_quick_ref_menu(self):
+        """Build static quick reference menu with common SSH/SCP commands."""
+        commands = [
+            ("SSH into VM", "ssh -p 2222 root@localhost"),
+            ("─" * 40, None),  # Separator
+            ("Pull single file", "scp -P 2222 root@localhost:/path/to/file /local/path/"),
+            ("Push single file", "scp -P 2222 /local/file root@localhost:/remote/path/"),
+            ("─" * 40, None),
+            ("Pull directory", "scp -P 2222 -r root@localhost:/remote/dir /local/path/"),
+            ("Push directory", "scp -P 2222 -r /local/dir root@localhost:/remote/path/"),
+            ("─" * 40, None),
+            ("Run command", "ssh -p 2222 root@localhost 'ls /home/'"),
+        ]
+        
+        for label, cmd in commands:
+            if cmd is None:
+                # Separator
+                sep = Gtk.SeparatorMenuItem()
+                self._quick_ref_menu.append(sep)
+            else:
+                item = Gtk.MenuItem(label=label)
+                item.set_tooltip_text(cmd)
+                item.connect("activate", lambda i, c=cmd: self._copy_command_to_clipboard(c))
+                self._quick_ref_menu.append(item)
+        
+        self._quick_ref_menu.show_all()
+
+    def _copy_command_to_clipboard(self, cmd):
+        """Copy a command to clipboard."""
+        try:
+            proc = subprocess.Popen(["xclip", "-selection", "clipboard"], 
+                                    stdin=subprocess.PIPE)
+            proc.communicate(cmd.encode())
+            notify("Command", f"Copied: {cmd}", "low")
+        except Exception:
+            self._warn("Copy Error", f"Could not copy to clipboard:\n\n{cmd}")
+
+    def _refresh_ssh_menu(self):
+        """Rebuild SSH menu with all running VMs that have SSH configured."""
+        # Clear existing menu
+        for item in self._ssh_menu.get_children():
+            self._ssh_menu.remove(item)
+        
+        # Get all running VMs with SSH configured
+        ssh_vms = []
+        for vm in self.vms:
+            if vm["_running"]:
+                self._ensure_ssh_config(vm)
+                user = vm.get("ssh_user", "root")
+                port = vm.get("ssh_port", "2222")
+                ssh_vms.append((vm["_pretty"], user, port, vm))
+        
+        if not ssh_vms:
+            # No running VMs - show placeholder
+            item = Gtk.MenuItem(label="No VMs running")
+            item.set_sensitive(False)
+            self._ssh_menu.append(item)
+        else:
+            # Add menu items for each running VM
+            for pretty_name, user, port, vm in sorted(ssh_vms):
+                ssh_cmd = f"ssh -p {port} {user}@localhost"
+                label = f"{pretty_name} ({user}@:{port})"
+                item = Gtk.MenuItem(label=label)
+                item.connect("activate", lambda i, v=vm: self._copy_ssh_for_vm(v))
+                self._ssh_menu.append(item)
+        
+        self._ssh_menu.show_all()
+
+
+
+    def _on_select(self, lb, row):
+        if row:
+            self.current_vm = row.vm
+            self._show_panel(row.vm)
+
+    # ── welcome ──
+
+    def _show_welcome(self):
+        self._clear_right()
+        self.right_box.set_valign(Gtk.Align.CENTER)
+        lbl = Gtk.Label()
+        lbl.set_markup('<span size="large" color="gray">Select a VM from the list\nor use the buttons above</span>')
+        lbl.set_halign(Gtk.Align.CENTER)
+        self.right_box.pack_start(lbl, True, True, 0)
+        self.right_box.show_all()
+
+    def _clear_right(self):
+        for c in self.right_box.get_children():
+            self.right_box.remove(c)
+
+    # ── section label helper ──
+
+    def _section(self, text):
+        lbl = Gtk.Label(label=text)
+        lbl.set_halign(Gtk.Align.START)
+        lbl.get_style_context().add_class("section-hdr")
+        return lbl
+
+    # ── SSH helpers ──
+
+    def _ensure_ssh_config(self, vm):
+        """Set SSH user and port in VM config."""
+        guest_os = vm.get("guest_os", "linux")
+        ssh_user = get_ssh_user(guest_os)
+        ssh_port = vm.get("ssh_port", "")
+        
+        if not ssh_port:
+            ssh_port = get_next_ssh_port(self.vms_dir, vm["_name"])
+            setconf("ssh_port", ssh_port, vm["_conf"])
+            vm["ssh_port"] = ssh_port
+        
+        if not vm.get("ssh_user"):
+            setconf("ssh_user", ssh_user, vm["_conf"])
+            vm["ssh_user"] = ssh_user
+        else:
+            ssh_user = vm["ssh_user"]
+        
+        # Add netdev to compat mode if needed
+        if vm.get("compat_mode") == "true" and not vm.get("netdev"):
+            netdev_line = f"user,hostname={vm['_name']},hostfwd=tcp::{ssh_port}-:22,id=nic"
+            setconf("netdev", netdev_line, vm["_conf"])
+            vm["netdev"] = netdev_line
+
+
+    def _ssh_copy_cmd(self, vm):
+        """Copy SSH command to clipboard."""
+        self._ensure_ssh_config(vm)
+        
+        user = vm.get("ssh_user", "root")
+        port = vm.get("ssh_port", "2222")
+        
+        ssh_cmd = f"ssh -p {port} {user}@localhost"
+        
+        try:
+            proc = subprocess.Popen(["xclip", "-selection", "clipboard"], 
+                                    stdin=subprocess.PIPE)
+            proc.communicate(ssh_cmd.encode())
+            notify("SSH", f"Command copied: {ssh_cmd}", "low")
+        except Exception:
+            self._warn("SSH Error", f"Could not copy to clipboard. Use command:\n\n{ssh_cmd}")
+
+    def _copy_ssh_for_vm(self, vm):
+        """Copy SSH command for a specific VM to clipboard."""
+        user = vm.get("ssh_user", "root")
+        port = vm.get("ssh_port", "2222")
+        ssh_cmd = f"ssh -p {port} {user}@localhost"
+        
+        try:
+            proc = subprocess.Popen(["xclip", "-selection", "clipboard"], 
+                                    stdin=subprocess.PIPE)
+            proc.communicate(ssh_cmd.encode())
+            notify("SSH", f"Copied: {ssh_cmd}", "low")
+        except Exception:
+            self._warn("SSH Error", f"Could not copy to clipboard. Use:\n\n{ssh_cmd}")
+
+
+        # ── VM detail panel ──
+
+    def _show_panel(self, vm):
+        self._clear_right()
+        self.right_box.set_valign(Gtk.Align.FILL)
+
+        # Title
+        t = Gtk.Label()
+        t.set_markup(f'<span size="x-large" weight="bold">{vm["_pretty"]}</span>')
+        t.set_halign(Gtk.Align.START)
+        self.right_box.pack_start(t, False, False, 0)
+        sub = Gtk.Label()
+        sub.set_markup(f'<span size="small" color="gray">{vm["_name"]}  •  {vm["_size"]}</span>')
+        sub.set_halign(Gtk.Align.START)
+        self.right_box.pack_start(sub, False, False, 2)
+        self.right_box.pack_start(Gtk.Separator(), False, False, 10)
+
+        # Launch / Stop
+        self.right_box.pack_start(self._section("LAUNCH"), False, False, 0)
+        launch_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        # check if VM is still being copied
+        flag = Path(self.vms_dir) / f".{vm['_name']}.copying"
+        if flag.exists():
+            copying_lbl = Gtk.Label()
+            copying_lbl.set_markup('<span color="#ff9800" weight="bold">⏳ Disk still copying — please wait…</span>')
+            launch_box.pack_start(copying_lbl, False, False, 0)
+        elif vm["_running"]:
+            running_lbl = Gtk.Label()
+            running_lbl.set_markup('<span color="#4caf50" weight="bold">VM is running</span>')
+            launch_box.pack_start(running_lbl, False, False, 0)
+            stop_btn = Gtk.Button(label="Stop VM")
+            stop_btn.connect("clicked", lambda b: self._stop_vm(vm))
+            launch_box.pack_start(stop_btn, False, False, 0)
+        else:
+            launch_btn = Gtk.Button(label="Launch VM")
+            launch_btn.get_style_context().add_class("launch-btn")
+            launch_btn.connect("clicked", lambda b: self._launch_vm(vm))
+            launch_box.pack_start(launch_btn, False, False, 0)
+        self.right_box.pack_start(launch_box, False, False, 4)
+
+        # SSH section — only when VM is running
+        if vm["_running"]:
+            self.right_box.pack_start(self._section("SSH"), False, False, 0)
+            ssh_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            
+            copy_btn = Gtk.Button(label="Copy SSH cmd")
+            copy_btn.get_style_context().add_class("ssh-btn")
+            copy_btn.set_tooltip_text("Copy SSH command to clipboard for manual use")
+            copy_btn.connect("clicked", lambda b: self._ssh_copy_cmd(vm))
+            ssh_box.pack_start(copy_btn, False, False, 0)
+            
+            self.right_box.pack_start(ssh_box, False, False, 6)
+
+        # Info
+        self.right_box.pack_start(self._section("INFO"), False, False, 0)
+        grid = Gtk.Grid()
+        grid.set_column_spacing(16)
+        grid.set_row_spacing(5)
+        infos = [
+            ("Guest OS",  vm.get("guest_os", "linux")),
+            ("Boot mode", vm.get("boot", "auto-detect")),
+            ("Disk",      vm.get("disk_img", "—")),
+            ("ISO",       vm.get("iso", "—") or "—"),
+        ]
+        for i, (k, v) in enumerate(infos):
+            kl = Gtk.Label(label=k + ":")
+            kl.set_halign(Gtk.Align.END)
+            kl.get_style_context().add_class("dim-label")
+            vl = Gtk.Label(label=v)
+            vl.set_halign(Gtk.Align.START)
+            vl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+            vl.set_max_width_chars(38)
+            grid.attach(kl, 0, i, 1, 1)
+            grid.attach(vl, 1, i, 1, 1)
+        self.right_box.pack_start(grid, False, False, 0)
+
+        # Settings
+        self.right_box.pack_start(self._section("SETTINGS"), False, False, 0)
+        sg = Gtk.Grid()
+        sg.set_column_spacing(16)
+        sg.set_row_spacing(8)
+
+        def sw_row(label, active, callback):
+            lbl = Gtk.Label(label=label + ":")
+            lbl.set_halign(Gtk.Align.END)
+            lbl.get_style_context().add_class("dim-label")
+            sw = Gtk.Switch()
+            sw.set_active(active)
+            sw.set_halign(Gtk.Align.START)
+            sw.connect("notify::active", callback)
+            return lbl, sw
+
+        cl, cs = sw_row("Compatibility mode",
+                        vm.get("compat_mode") == "true",
+                        lambda sw, p, v=vm: setconf("compat_mode",
+                            "true" if sw.get_active() else "false", v["_conf"]) or
+                            v.update({"compat_mode": "true" if sw.get_active() else "false"}))
+        sg.attach(cl, 0, 0, 1, 1); sg.attach(cs, 1, 0, 1, 1)
+        compat_hint = Gtk.Label()
+        compat_hint.set_markup('<span size="small" color="gray">Use minimal QEMU without VirGL — for lightweight or older distros that show a blank screen.</span>')
+        compat_hint.set_halign(Gtk.Align.START)
+        compat_hint.set_line_wrap(True)
+        compat_hint.set_max_width_chars(42)
+        sg.attach(compat_hint, 1, 1, 1, 1)
+
+        bl = Gtk.Label(label="Boot mode:")
+        bl.set_halign(Gtk.Align.END)
+        bl.get_style_context().add_class("dim-label")
+        bc = Gtk.ComboBoxText()
+        for bid, blbl in [("auto","Auto-detect"),("uefi","UEFI"),("legacy","Legacy (BIOS)")]:
+            bc.append(bid, blbl)
+        cur = vm.get("boot", "auto")
+        bc.set_active_id(cur if cur in ("uefi","legacy") else "auto")
+        bc.connect("changed", self._on_boot_changed, vm)
+        sg.attach(bl, 0, 2, 1, 1); sg.attach(bc, 1, 2, 1, 1)
+
+        stl, sts = sw_row("Mark as stable",
+                          vm.get("confirmed") == "true",
+                          lambda sw, p, v=vm: setconf("confirmed",
+                              "true" if sw.get_active() else "false", v["_conf"]) or
+                              v.update({"confirmed": "true" if sw.get_active() else "false"}))
+        sg.attach(stl, 0, 3, 1, 1); sg.attach(sts, 1, 3, 1, 1)
+        stable_hint = Gtk.Label()
+        stable_hint.set_markup('<span size="small" color="gray">When on: hides launch notifications and locks the Danger Zone.</span>')
+        stable_hint.set_halign(Gtk.Align.START)
+        stable_hint.set_line_wrap(True)
+        stable_hint.set_max_width_chars(42)
+        sg.attach(stable_hint, 1, 4, 1, 1)
+        self.right_box.pack_start(sg, False, False, 0)
+
+        # Snapshots — always show
+        self.right_box.pack_start(self._section("SNAPSHOTS"), False, False, 0)
+        snap_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+
+        if not vm["_has_disk"]:
+            nl = Gtk.Label(label="No disk yet — launch VM first to create one")
+            nl.get_style_context().add_class("dim-label")
+            nl.set_halign(Gtk.Align.START)
+            snap_vbox.pack_start(nl, False, False, 0)
+        else:
+            snaps = get_snapshots(vm["_disk"])
+            if snaps:
+                for snap in snaps:
+                    row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                    lbl = Gtk.Label(label=f"  * {snap['tag']}")
+                    lbl.set_halign(Gtk.Align.START)
+                    row.pack_start(lbl, True, True, 0)
+                    for action_label, action_cb in [
+                        ("Apply",  lambda b, t=snap["tag"]: self._snap_apply(vm, t)),
+                        ("Delete", lambda b, t=snap["tag"]: self._snap_delete(vm, t)),
+                    ]:
+                        btn = Gtk.Button(label=action_label)
+                        btn.set_size_request(68, -1)
+                        btn.connect("clicked", action_cb)
+                        row.pack_end(btn, False, False, 0)
+                    snap_vbox.pack_start(row, False, False, 0)
+            else:
+                nl = Gtk.Label(label="No snapshots yet")
+                nl.get_style_context().add_class("dim-label")
+                nl.set_halign(Gtk.Align.START)
+                snap_vbox.pack_start(nl, False, False, 0)
+
+            # Create snapshot row
+            create_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            self._snap_entry = Gtk.Entry()
+            self._snap_entry.set_placeholder_text("New snapshot tag…")
+            self._snap_entry.set_size_request(160, -1)
+            create_btn = Gtk.Button(label="Create snapshot")
+            create_btn.connect("clicked", lambda b: self._snap_create(vm))
+            create_row.pack_start(self._snap_entry, False, False, 0)
+            create_row.pack_start(create_btn, False, False, 0)
+            snap_vbox.pack_start(create_row, False, False, 6)
+
+        self.right_box.pack_start(snap_vbox, False, False, 0)
+
+        # Actions
+        self.right_box.pack_start(self._section("ACTIONS"), False, False, 0)
+        act_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for label, tooltip, cb in [
+            ("Edit conf",   "Open the VM configuration file in a text editor",  lambda b: subprocess.Popen(["geany", vm["_conf"]])),
+            ("Clone VM",    "Create a full copy of this VM with a new name",     lambda b: self._clone_vm(vm)),
+            ("Open dir",    "Open the VM directory in the file manager",          lambda b: subprocess.Popen(["xdg-open", str(Path(self.vms_dir) / vm["_name"])])),
+        ]:
+            btn = Gtk.Button(label=label)
+            btn.set_tooltip_text(tooltip)
+            btn.connect("clicked", cb)
+            act_box.pack_start(btn, False, False, 0)
+        self.right_box.pack_start(act_box, False, False, 0)
+
+        # Danger zone
+        self.right_box.pack_start(self._section("DANGER ZONE"), False, False, 0)
+        dng_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        is_stable = vm.get("confirmed") == "true"
+        stable_tip = "Mark VM as unstable first to enable this action"
+        for label, tooltip, cb in [
+            ("Delete disk",  "Remove the disk image only — keeps ISO and config",         lambda b: self._delete_disk(vm)),
+            ("Format disk",  "Create or re-format the disk — erases all data",            lambda b: self._dlg_format_disk(vm)),
+            ("Delete VM",    "Permanently remove all VM files including disk and config",  lambda b: self._delete_vm(vm)),
+        ]:
+            btn = Gtk.Button(label=label)
+            btn.set_tooltip_text(stable_tip if is_stable else tooltip)
+            btn.get_style_context().add_class("danger-btn")
+            btn.set_sensitive(not is_stable)
+            btn.connect("clicked", cb)
+            dng_box.pack_start(btn, False, False, 0)
+        self.right_box.pack_start(dng_box, False, False, 0)
+
+        self.right_box.show_all()
+
+    # ── launch / stop ──
+
+    def _launch_vm(self, vm):
+        """
+        Launch VM with proper boot/reboot handling.
+        
+        FIXED BOOT CHAIN (v2):
+        - OVMF_VARS.fd created once, NEVER reset (persists EFI bootloader registration)
+        - PATH A: ISO + Disk (install phase) -> uses persistent OVMF_VARS + -boot order=d
+        - PATH B: Disk only (post-install) -> uses saved OVMF_VARS with bootloader entry
+        - PATH C: Special modes (legacy, raw IMG) -> separate handling
+        """
+        vmname    = vm["_name"]
+        vmdir     = str(Path(self.vms_dir) / vmname)
+        conf_path = vm["_conf"]
+        compat    = vm.get("compat_mode") == "true"
+        boot      = vm.get("boot", "legacy")
+        confirmed = vm.get("confirmed") == "true"
+        disk_if   = vm.get("disk_if", "")
+        net_dev   = vm.get("net_device", "e1000")
+        disk_img  = vm.get("disk_img", "")
+        iso       = vm.get("iso", "")
+        disk_path = str(Path(self.vms_dir) / disk_img) if disk_img else ""
+        iso_path  = str(Path(self.vms_dir) / iso) if iso else ""
+        
+        # Create vmdir if needed
+        Path(vmdir).mkdir(parents=True, exist_ok=True)
+
+        # OVMF setup — persistent, never reset
+        ovmf_vars = str(Path(vmdir) / "OVMF_VARS.fd")
+        if boot == "uefi":
+            # Create OVMF_VARS ONCE. Then leave it alone forever.
+            # This allows EFI bootloader registration to persist across installs.
+            if not Path(ovmf_vars).exists() and OVMF_VARS_TEMPLATE:
+                shutil.copy(str(OVMF_VARS_TEMPLATE), ovmf_vars)
+
+        # Ensure disk exists
+        if disk_path and not Path(disk_path).exists():
+            disk_size = vm.get("disk_size", "32G")
+            subprocess.run(["qemu-img", "create", "-f", "qcow2", disk_path, disk_size])
+
+        # Ensure SSH config before launch
+        self._ensure_ssh_config(vm)
+
+        accel   = "kvm" if KVM_AVAILABLE else "tcg"
+
+        notify("quickbox-gui", f"Launching {vmname}", "low")
+
+        # Base QEMU args (all modes)
+        # Note: RAM and CPU allocation handled by quickemu wrapper or QEMU defaults
+        base_args = [
+            "qemu-system-x86_64",
+            "-name", f"{vmname},process={vmname}",
+            "-machine", f"q35,accel={accel}",
+            "-cpu", "host" if KVM_AVAILABLE else "max",
+            "-vga", "std",
+            "-display", "gtk,zoom-to-fit=on",
+            "-no-reboot",
+        ]
+
+        log = f"/tmp/qemu-{vmname}.log"
+        ssh_port = vm.get("ssh_port", "2222")
+
+        if compat:
+            # PATH C: Special modes (EasyOS raw IMG, legacy boot, custom disk_if)
+            # ──────────────────────────────────────────────────────────────────
+            if disk_if:
+                # EasyOS or other custom formats with disk_if (ide, ahci, etc)
+                cmd = base_args + [
+                    "-drive", f"format=qcow2,file={disk_path},if={disk_if}",
+                    "-device", f"{net_dev},netdev=nic",
+                    "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                ]
+            # ──────────────────────────────────────────────────────────────────
+            # PATH A+C: Raw IMG file (legacy or UEFI)
+            # ──────────────────────────────────────────────────────────────────
+            elif iso_path and iso_path.endswith((".img", ".IMG")):
+                # Raw disk image — use as-is, no CDROM
+                if boot == "uefi" and OVMF_CODE:
+                    # UEFI + raw IMG
+                    cmd = base_args + [
+                        "-drive", f"if=pflash,format=raw,unit=0,file={OVMF_CODE},readonly=on",
+                        "-drive", f"if=pflash,format=raw,unit=1,file={ovmf_vars}",
+                        "-drive", f"format=raw,file={iso_path}",
+                        "-device", f"{net_dev},netdev=nic",
+                        "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                    ]
+                else:
+                    # Legacy + raw IMG
+                    cmd = base_args + [
+                        "-boot", "order=c",
+                        "-drive", f"format=raw,file={iso_path}",
+                        "-device", f"{net_dev},netdev=nic",
+                        "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                    ]
+            # ──────────────────────────────────────────────────────────────────
+            # PATH A: ISO + Disk (install phase)
+            # ──────────────────────────────────────────────────────────────────
+            elif iso_path and Path(iso_path).exists():
+                # Have both ISO and disk — installation phase
+                if boot == "uefi" and OVMF_CODE:
+                    # UEFI ISO install
+                    # -boot order=d forces CDROM first during install
+                    # Bootloader writes EFI entry to ovmf_vars.fd
+                    # Post-install reboot: firmware finds entry, boots disk
+                    cmd = base_args + [
+                        "-boot", "order=d",
+                        "-drive", f"if=pflash,format=raw,unit=0,file={OVMF_CODE},readonly=on",
+                        "-drive", f"if=pflash,format=raw,unit=1,file={ovmf_vars}",
+                        "-drive", f"media=cdrom,file={iso_path}",
+                        "-drive", f"format=qcow2,file={disk_path}",
+                        "-device", f"{net_dev},netdev=nic",
+                        "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                    ]
+                else:
+                    # Legacy ISO install
+                    cmd = base_args + [
+                        "-boot", "order=d",
+                        "-drive", f"media=cdrom,file={iso_path}",
+                        "-drive", f"format=qcow2,file={disk_path}",
+                        "-device", f"{net_dev},netdev=nic",
+                        "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                    ]
+            # ──────────────────────────────────────────────────────────────────
+            # PATH B: Disk only (post-install)
+            # ──────────────────────────────────────────────────────────────────
+            else:
+                # ISO removed or missing — post-install phase, boot from disk
+                if boot == "uefi" and OVMF_CODE:
+                    # UEFI disk boot
+                    # ovmf_vars.fd has bootloader entry from install
+                    # No -boot order override; firmware uses saved entry
+                    cmd = base_args + [
+                        "-drive", f"if=pflash,format=raw,unit=0,file={OVMF_CODE},readonly=on",
+                        "-drive", f"if=pflash,format=raw,unit=1,file={ovmf_vars}",
+                        "-drive", f"format=qcow2,file={disk_path}",
+                        "-device", f"{net_dev},netdev=nic",
+                        "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                    ]
+                else:
+                    # Legacy disk boot
+                    cmd = base_args + [
+                        "-boot", "order=c",
+                        "-drive", f"format=qcow2,file={disk_path}",
+                        "-device", f"{net_dev},netdev=nic",
+                        "-netdev", f"user,hostname={vmname},hostfwd=tcp::{ssh_port}-:22,id=nic",
+                    ]
+
+        else:
+            # Normal quickemu path (non-compat)
+            cmd = ["quickemu", "--vm", conf_path]
+
+        with open(log, "w") as logfile:
+            subprocess.Popen(cmd, stdout=logfile, stderr=logfile)
+
+        GLib.timeout_add(3000, self._refresh)
+
+    def _select_vm_by_name(self, name):
+        """Select and show a VM by name after refresh."""
+        for row in self.listbox.get_children():
+            if hasattr(row, "vm") and row.vm["_name"] == name:
+                self.listbox.select_row(row)
+                self.current_vm = row.vm
+                self._show_panel(row.vm)
+                return False
+        return False
+
+    def _stop_vm(self, vm):
+        subprocess.Popen(["pkill", "-f", f"name {vm['_name']},process={vm['_name']}"])
+        GLib.timeout_add(1500, self._refresh)
+
+    # ── boot mode ──
+
+    def _on_boot_changed(self, combo, vm):
+        val = combo.get_active_id()
+        if val == "auto":
+            remove_key("boot", vm["_conf"])
+        else:
+            setconf("boot", val, vm["_conf"])
+        vm["boot"] = val
+
+    # ── snapshots ──
+
+    def _snap_create(self, vm):
+        tag = self._snap_entry.get_text().strip()
+        if not tag:
+            return
+        if vm["_running"]:
+            self._warn("VM is running", "Stop the VM before creating a snapshot.")
+            return
+        disk = vm["_disk"]
+        if not Path(disk).exists():
+            self._warn("No disk", "Disk image not found.")
+            return
+        existing = [s["tag"] for s in get_snapshots(disk)]
+        if tag in existing:
+            self._warn("Duplicate tag", f"Snapshot '{tag}' already exists.")
+            return
+        result = subprocess.run(
+            ["qemu-img", "snapshot", "-c", tag, disk],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            self._snap_entry.set_text("")
+            notify("quickbox-gui", f"Snapshot '{tag}' created.", "low")
+            self._show_panel(vm)
+        else:
+            self._warn("Snapshot failed", result.stderr or "qemu-img returned an error.")
+
+    def _snap_apply(self, vm, tag):
+        if not self._confirm(f"Apply snapshot '{tag}'?",
+                             "This will overwrite the current disk state."):
+            return
+        subprocess.run(["qemu-img", "snapshot", "-a", tag, vm["_disk"]])
+        notify("quickbox", f"Snapshot '{tag}' applied. Launch VM from menu.")
+
+    def _snap_delete(self, vm, tag):
+        if not self._confirm(f"Delete snapshot '{tag}'?", "This cannot be undone."):
+            return
+        subprocess.run(["qemu-img", "snapshot", "-d", tag, vm["_disk"]])
+        self._show_panel(vm)
+
+    # ── clone ──
+
+    def _clone_vm(self, vm):
+        import datetime
+        date_str  = datetime.datetime.now().strftime("%Y%m%d")
+        suggested = f"{vm['_name']}-{date_str}"
+
+        dlg = Gtk.Dialog(title="Clone VM", parent=self, flags=0)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Clone", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(16); box.set_margin_bottom(16)
+        box.set_margin_start(16); box.set_margin_end(16)
+        box.pack_start(Gtk.Label(label=f"Clone '{vm['_pretty']}' as:"), False, False, 0)
+        entry = Gtk.Entry()
+        entry.set_text(suggested)
+        entry.set_tooltip_text("Name for the cloned VM — date suffix helps track when it was made")
+        box.pack_start(entry, False, False, 0)
+        hint = Gtk.Label()
+        hint.set_markup('<span size="small" color="gray">The clone will appear in the VM list as a separate VM.</span>')
+        hint.set_halign(Gtk.Align.START)
+        box.pack_start(hint, False, False, 0)
+        dlg.show_all()
+        r = dlg.run()
+        name = entry.get_text().strip()
+        dlg.destroy()
+
+        if r != Gtk.ResponseType.OK or not name:
+            return
+
+        dest_name = name.replace(" ", "-").lower()
+        dest_dir  = Path(self.vms_dir) / dest_name
+        dest_conf = Path(self.vms_dir) / f"{dest_name}.conf"
+        src_dir   = Path(self.vms_dir) / vm["_name"]
+        src_conf  = Path(vm["_conf"])
+
+        if dest_dir.exists() or dest_conf.exists():
+            self._warn("Already exists", f"VM '{dest_name}' already exists.")
+            return
+
+        try:
+            src_vm = read_vm_conf(str(src_conf))
+            skip_keys = {"vm_ram", "vm_cpu", "ssh_port"}
+
+            out = ["#!/usr/bin/quickemu --vm"]
+            for k, v in src_vm.items():
+                if k in skip_keys:
+                    continue
+                if k == "pretty":
+                    out.append(f'pretty="{name}"')
+                elif k == "disk_img" and v and vm["_name"] in v:
+                    out.append(f'{k}="{v.replace(vm["_name"], dest_name)}"')
+                elif v:
+                    out.append(f'{k}="{v}"')
+                else:
+                    out.append(f'{k}=')
+            if "pretty" not in src_vm:
+                out.append(f'pretty="{name}"')
+            dest_conf.write_text("\n".join(out) + "\n")
+            dest_conf.chmod(0o755)
+        except Exception as e:
+            self._warn("Clone failed", f"Could not write conf: {e}")
+            return
+
+        # refresh immediately so VM appears in list
+        self._refresh()
+        self._select_vm_by_name(dest_name)
+
+        # write a flag file so launch is blocked while copying
+        flag = Path(self.vms_dir) / f".{dest_name}.copying"
+        flag.touch()
+
+        # copy directory in background (may take a while for large disks)
+        def _copy_dir():
+            try:
+                shutil.copytree(str(src_dir), str(dest_dir))
+                flag.unlink(missing_ok=True)
+                notify("quickbox-gui", f"Clone complete: '{name}' — ready to use", "low")
+                GLib.idle_add(self._refresh)
+                GLib.timeout_add(200, lambda: self._select_vm_by_name(dest_name) or False)
+            except Exception as e:
+                flag.unlink(missing_ok=True)
+                GLib.idle_add(self._warn, "Clone failed", f"Directory copy failed: {str(e)}")
+                GLib.idle_add(dest_conf.unlink)
+
+        threading.Thread(target=_copy_dir, daemon=True).start()
+
+    # ── delete ──
+
+    def _dlg_format_disk(self, vm):
+        """Dialog to create/re-format the VM disk with a chosen partition layout."""
+        dlg = Gtk.Dialog(title="Format disk", parent=self, flags=0)
+        dlg.set_default_size(420, 320)
+        dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Format", Gtk.ResponseType.OK)
+        box = dlg.get_content_area()
+        box.set_spacing(10)
+        box.set_margin_top(16); box.set_margin_bottom(16)
+        box.set_margin_start(16); box.set_margin_end(16)
+
+        # Warning
+        warn = Gtk.Label()
+        warn.set_markup('<span color="#f44336" weight="bold">⚠ This will ERASE all data on the disk!</span>')
+        warn.set_halign(Gtk.Align.START)
+        box.pack_start(warn, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 4)
+
+        # Disk size
+        size_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        size_lbl = Gtk.Label(label="Disk size (GB):")
+        size_lbl.get_style_context().add_class("dim-label")
+        size_spin = Gtk.SpinButton()
+        size_spin.set_range(4, 500)
+        size_spin.set_increments(1, 10)
+        # read current size from conf or default 20G
+        current_size = vm.get("disk_size", "20G").replace("G","").replace("g","")
+        try:
+            size_spin.set_value(int(current_size))
+        except ValueError:
+            size_spin.set_value(20)
+        size_spin.set_size_request(80, -1)
+        size_box.pack_start(size_lbl, False, False, 0)
+        size_box.pack_start(size_spin, False, False, 0)
+        box.pack_start(size_box, False, False, 0)
+
+        # Partition layout
+        layout_lbl = Gtk.Label(label="Partition layout:")
+        layout_lbl.set_halign(Gtk.Align.START)
+        layout_lbl.get_style_context().add_class("dim-label")
+        box.pack_start(layout_lbl, False, False, 0)
+
+        layouts = [
+            ("gpt_esp_ext4",  "GPT — 512MB FAT32 ESP  +  ext4 (rest)",
+             "UEFI boot — recommended for modern distros"),
+            ("msdos_ext4",    "MSDOS — ext4 (whole disk)",
+             "Legacy/BIOS boot — for SliTaz, TinyCore, older distros"),
+            ("msdos_fat32",   "MSDOS — FAT32 (whole disk)",
+             "For distros that need FAT32 working partition (e.g. EasyOS style)"),
+            ("blank",         "Blank — no partitions (raw qcow2)",
+             "Let the distro installer handle partitioning"),
+        ]
+
+        radios = []
+        first = None
+        for lid, lname, ldesc in layouts:
+            rb = Gtk.RadioButton.new_with_label_from_widget(first, lname)
+            rb._layout_id = lid
+            if first is None:
+                first = rb
+            rb.set_tooltip_text(ldesc)
+            radios.append(rb)
+            box.pack_start(rb, False, False, 0)
+
+        dlg.show_all()
+        r = dlg.run()
+        size_gb = int(size_spin.get_value())
+        layout = next((rb._layout_id for rb in radios if rb.get_active()), "blank")
+        dlg.destroy()
+
+        if r != Gtk.ResponseType.OK:
+            return
+
+        # confirm destructive action
+        if not self._confirm(
+            "Format disk?",
+            f"This will create a new {size_gb}GB disk with layout: {layout}\n\n"
+            f"All existing data on the disk will be lost."
+        ):
+            return
+
+        disk_path = vm["_disk"] or str(Path(self.vms_dir) / vm["_name"] / "disk.qcow2")
+
+        def _do_format():
+            import tempfile
+            tmp = tempfile.mktemp(suffix=".raw", dir=self.vms_dir)
+            try:
+                GLib.idle_add(notify, "quickbox-gui",
+                              f"Formatting {size_gb}GB disk…", "low")
+
+                # create raw image
+                subprocess.run(["qemu-img", "create", "-f", "raw", tmp, f"{size_gb}G"],
+                               check=True)
+
+                if layout == "gpt_esp_ext4":
+                    subprocess.run(["parted", "-s", tmp,
+                        "mklabel", "gpt",
+                        "mkpart", "ESP", "fat32", "1MiB", "513MiB",
+                        "set", "1", "esp", "on",
+                        "mkpart", "primary", "ext4", "513MiB", "100%"],
+                        check=True)
+                elif layout == "msdos_ext4":
+                    subprocess.run(["parted", "-s", tmp,
+                        "mklabel", "msdos",
+                        "mkpart", "primary", "ext4", "1MiB", "100%"],
+                        check=True)
+                elif layout == "msdos_fat32":
+                    subprocess.run(["parted", "-s", tmp,
+                        "mklabel", "msdos",
+                        "mkpart", "primary", "fat32", "1MiB", "100%"],
+                        check=True)
+                # blank — no partitions
+
+                # convert raw → qcow2
+                Path(disk_path).parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                                 tmp, disk_path], check=True)
+
+                setconf("disk_size", f"{size_gb}G", vm["_conf"])
+                vm["disk_size"] = f"{size_gb}G"
+
+                GLib.idle_add(notify, "quickbox-gui",
+                              f"Disk ready: {layout}, {size_gb}GB", "low")
+                GLib.idle_add(self._refresh)
+
+            except subprocess.CalledProcessError as e:
+                GLib.idle_add(self._warn, "Format failed",
+                              f"Command failed: {' '.join(str(x) for x in e.cmd)}")
+            finally:
+                if Path(tmp).exists():
+                    Path(tmp).unlink()
+
+        self._run_with_progress(
+            f"Formatting disk — {size_gb}GB {layout}",
+            ["true"],   # placeholder — real work runs in thread below
+        )
+        threading.Thread(target=_do_format, daemon=True).start()
+
+    def _delete_disk(self, vm):
+        if not self._confirm("Delete disk image?",
+                             f"Removes disk for '{vm['_pretty']}'. ISO stays."):
+            return
+        disk = Path(self.vms_dir) / vm.get("disk_img", "")
+        if disk.exists():
+            disk.unlink()
+        self._refresh()
+
+    def _delete_vm(self, vm):
+        if not self._confirm(f"Delete VM '{vm['_pretty']}' completely?",
+                             "All files removed. Cannot be undone."):
+            return
+        for p in [Path(self.vms_dir) / vm["_name"], Path(vm["_conf"])]:
+            if p.exists():
+                if p.is_dir():
+                    shutil.rmtree(str(p))
+                else:
+                    p.unlink()
+        self.current_vm = None
+        self._refresh()
+        self._show_welcome()
+
+    # ── download / custom ──
+
+    def _parse_quickinst(self):
+        """Parse distro list from ~/.config/quickbox/quickinst.csv."""
+        clean_csv = Path.home() / ".config/quickbox/quickinst.csv"
+        distros = []
+        if not clean_csv.exists():
+            return distros
+        for line in clean_csv.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",", 1)
+            if len(parts) == 2:
+                name = parts[0].strip()
+                cmd  = parts[1].strip()
+                if name and cmd:
+                    distros.append((name, cmd))
+        return sorted(distros, key=lambda x: x[0].lower())
+
+    def _get_distro_versions(self, distros, distro_name):
+        """Get all available versions/editions for a distro name (first word match)."""
+        # Extract base distro from display name — e.g. "Ubuntu 24.04 LTS" -> "ubuntu"
+        first_word = distro_name.split()[0].lower()
+        versions = []
+        for name, cmd in distros:
+            parts = cmd.split()  # quickget distro release edition
+            if len(parts) >= 2 and parts[1].lower() == first_word:
+                # version label = everything after distro name in display
+                label = name
+                versions.append((label, cmd))
+        return versions
+
+    def _dlg_download(self, *_):
+        distros = self._parse_quickinst()
+
+        dlg = Gtk.Dialog(title="Download Distro", parent=self, flags=0)
+        dlg.set_default_size(640, 520)
+        dlg.add_buttons("Close", Gtk.ResponseType.CLOSE)
+        box = dlg.get_content_area()
+        box.set_spacing(0)
+
+        # Hint text (no search bar)
+        hint_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hint_box.set_margin_top(8); hint_box.set_margin_bottom(8)
+        hint_box.set_margin_start(12); hint_box.set_margin_end(12)
+        hint_lbl = Gtk.Label()
+        hint_lbl.set_markup('<span size="small" color="gray">Use alphabet buttons to jump to distro</span>')
+        hint_lbl.set_halign(Gtk.Align.START)
+        hint_box.pack_start(hint_lbl, False, False, 0)
+        box.pack_start(hint_box, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 0)
+
+        # Main area: alphabet sidebar + distro list
+        main_hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        box.pack_start(main_hbox, True, True, 0)
+
+        # Alphabet sidebar
+        alpha_scroll = Gtk.ScrolledWindow()
+        alpha_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        alpha_scroll.set_size_request(42, -1)
+        alpha_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+        alpha_box.set_margin_top(4); alpha_box.set_margin_bottom(4)
+        alpha_box.set_margin_start(4); alpha_box.set_margin_end(4)
+        alpha_scroll.add(alpha_box)
+        main_hbox.pack_start(alpha_scroll, False, False, 0)
+        main_hbox.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+
+        # Distro list
+        list_scroll = Gtk.ScrolledWindow()
+        list_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        listbox = Gtk.ListBox()
+        listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        list_scroll.add(listbox)
+        main_hbox.pack_start(list_scroll, True, True, 0)
+
+        # Populate
+        row_map = {}
+        current_letter = ""
+        for name, cmd in distros:
+            first = name[0].upper() if name else "?"
+            if first != current_letter:
+                current_letter = first
+                hdr = Gtk.ListBoxRow()
+                hdr.set_selectable(False)
+                hdr.set_sensitive(False)
+                lbl = Gtk.Label()
+                lbl.set_markup(f'<b><span size="small" color="gray">{first}</span></b>')
+                lbl.set_halign(Gtk.Align.START)
+                lbl.set_margin_start(10); lbl.set_margin_top(6); lbl.set_margin_bottom(2)
+                hdr.add(lbl)
+                listbox.add(hdr)
+                row_map[first] = hdr
+            row = Gtk.ListBoxRow()
+            row._distro_name = name
+            row._distro_cmd  = cmd
+            rl = Gtk.Label(label=f"  {name}")
+            rl.set_halign(Gtk.Align.START)
+            rl.set_margin_top(5); rl.set_margin_bottom(5)
+            row.add(rl)
+            listbox.add(row)
+
+        # Alphabet buttons - click to jump to that letter
+        for letter in sorted(row_map.keys()):
+            btn = Gtk.Button(label=letter)
+            btn.set_relief(Gtk.ReliefStyle.NONE)
+            btn.set_size_request(34, 28)
+            def _scroll_to(b, ltr, rm=row_map, ls=list_scroll):
+                r = rm.get(ltr)
+                if r:
+                    ls.get_vadjustment().set_value(r.get_allocation().y)
+            btn.connect("clicked", _scroll_to, letter)
+            alpha_box.pack_start(btn, False, False, 0)
+
+        # Row activated -> download dialog
+        def _on_activate(lb, row):
+            if not row.get_selectable():
+                return
+            self._dlg_do_download(row._distro_name, row._distro_cmd, distros, dlg)
+
+        listbox.connect("row-activated", _on_activate)
+
+        box.pack_start(Gtk.Separator(), False, False, 0)
+        hint2 = Gtk.Label()
+        hint2.set_markup('<span size="small" color="gray">  Click a distro to select version and download</span>')
+        hint2.set_halign(Gtk.Align.START)
+        hint2.set_margin_top(6); hint2.set_margin_bottom(6)
+        box.pack_start(hint2, False, False, 0)
+
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def _dlg_do_download(self, distro_name, distro_cmd, distros, parent_dlg):
+        """Download dialog with version picker, progress bar, optional output log."""
+
+        # Build version list for this distro family
+        cmd_parts = distro_cmd.split()
+        base_distro = cmd_parts[1] if len(cmd_parts) > 1 else distro_name
+        versions = [(name, cmd) for name, cmd in distros
+                    if cmd.split()[1].lower() == base_distro.lower()
+                    if len(cmd.split()) > 1]
+        if not versions:
+            versions = [(distro_name, distro_cmd)]
+
+        # Version labels for dropdown
+        version_labels = [name for name, cmd in versions]
+        # find default (first entry that matches clicked name)
+        default_idx = next((i for i, (n, c) in enumerate(versions)
+                            if n == distro_name), 0)
+
+        dlg = Gtk.Dialog(title=f"Download — {base_distro}", parent=self, flags=0)
+        dlg.set_default_size(560, 420)
+        box = dlg.get_content_area()
+        box.set_spacing(0)
+        box.set_margin_top(16); box.set_margin_bottom(16)
+        box.set_margin_start(16); box.set_margin_end(16)
+
+        # Title
+        title_lbl = Gtk.Label()
+        title_lbl.set_markup(f'<b><span size="large">{base_distro.title()}</span></b>')
+        title_lbl.set_halign(Gtk.Align.START)
+        box.pack_start(title_lbl, False, False, 0)
+
+        box.pack_start(Gtk.Separator(), False, False, 8)
+
+        # Version/edition selector
+        ver_lbl = Gtk.Label(label="Version / edition:")
+        ver_lbl.set_halign(Gtk.Align.START)
+        ver_lbl.get_style_context().add_class("dim-label")
+        box.pack_start(ver_lbl, False, False, 2)
+
+        ver_combo = Gtk.ComboBoxText()
+        for label in version_labels:
+            ver_combo.append_text(label)
+        ver_combo.set_active(default_idx)
+        box.pack_start(ver_combo, False, False, 4)
+
+        # Command preview / manual edit
+        cmd_lbl = Gtk.Label(label="Command (editable):")
+        cmd_lbl.set_halign(Gtk.Align.START)
+        cmd_lbl.get_style_context().add_class("dim-label")
+        box.pack_start(cmd_lbl, False, False, 6)
+
+        cmd_entry = Gtk.Entry()
+        cmd_entry.set_text(versions[default_idx][1])
+        cmd_entry.set_editable(True)
+        box.pack_start(cmd_entry, False, False, 2)
+
+        # sync combo → entry
+        def _on_ver_changed(combo):
+            idx = combo.get_active()
+            if 0 <= idx < len(versions):
+                cmd_entry.set_text(versions[idx][1])
+        ver_combo.connect("changed", _on_ver_changed)
+
+        box.pack_start(Gtk.Separator(), False, False, 10)
+
+        # Progress bar
+        progress = Gtk.ProgressBar()
+        progress.set_text("Ready to download")
+        progress.set_show_text(True)
+        progress.set_fraction(0)
+        box.pack_start(progress, False, False, 0)
+
+        note = Gtk.Label()
+        note.set_markup('<span size="small" color="gray">Download time varies depending on ISO size and server speed.</span>')
+        note.set_halign(Gtk.Align.START)
+        note.set_margin_top(2)
+        box.pack_start(note, False, False, 0)
+
+        # Show/hide output toggle — removed, not needed for download
+
+        # Buttons
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_box.set_margin_top(12)
+        cancel_btn = Gtk.Button(label="Cancel")
+        dl_btn     = Gtk.Button(label="Download")
+        dl_btn.get_style_context().add_class("launch-btn")
+        btn_box.pack_end(dl_btn, False, False, 0)
+        btn_box.pack_end(cancel_btn, False, False, 0)
+        box.pack_start(btn_box, False, False, 0)
+
+        dlg.show_all()
+
+        # State
+        self._dl_process  = None
+        self._dl_cancelled = False
+        self._dl_watching  = False
+
+        def _find_growing_file():
+            """Find the newest/largest file being written in vms_dir."""
+            try:
+                files = []
+                for f in Path(self.vms_dir).iterdir():
+                    if f.is_file() and f.suffix.lower() in (
+                            ".iso", ".img", ".qcow2", ".gz", ".xz", ".zip",
+                            ".part", ".tmp", ".download"):
+                        files.append((f.stat().st_mtime, f))
+                if files:
+                    return sorted(files)[-1][1]
+            except Exception:
+                pass
+            return None
+
+        def _watch_progress():
+            """Poll the growing download file every second, update progress bar."""
+            import math, time
+            elapsed = 0
+            last_size = 0
+            stall_count = 0
+            target_file = None
+
+            while self._dl_watching and not self._dl_cancelled:
+                time.sleep(1)
+                if not self._dl_watching or self._dl_cancelled:
+                    break
+                elapsed += 1
+
+                # try to find the file being downloaded
+                if target_file is None or not target_file.exists():
+                    target_file = _find_growing_file()
+
+                if target_file and target_file.exists():
+                    try:
+                        size = target_file.stat().st_size
+                        mb = size / (1024 * 1024)
+
+                        if size > last_size:
+                            stall_count = 0
+                            # logarithmic curve: grows fast then slows, never hits 1.0
+                            # reaches ~0.5 at 200MB, ~0.7 at 1GB, ~0.9 at 8GB
+                            fraction = math.log1p(mb) / (math.log1p(mb) + 8)
+                            fraction = min(fraction, 0.95)
+                            speed = (size - last_size) / (1024 * 1024)
+                            GLib.idle_add(progress.set_fraction, fraction)
+                            GLib.idle_add(progress.set_text,
+                                f"Downloading… {mb:.0f} MB  ({speed:.1f} MB/s)")
+                            last_size = size
+                        else:
+                            stall_count += 1
+                            if stall_count > 5:
+                                # file not growing — verifying/extracting phase
+                                GLib.idle_add(progress.set_text, "Verifying…")
+                    except Exception:
+                        pass
+                else:
+                    # no file found yet — slow logarithmic pulse based on time
+                    fraction = math.log1p(elapsed / 10) / (math.log1p(elapsed / 10) + 6)
+                    fraction = min(fraction, 0.4)
+                    GLib.idle_add(progress.set_fraction, fraction)
+                    GLib.idle_add(progress.set_text, f"Connecting… ({elapsed}s)")
+
+        def _run_download():
+            cmd = cmd_entry.get_text().strip().split()
+            GLib.idle_add(progress.set_text, f"Starting download…")
+            GLib.idle_add(dl_btn.set_sensitive, False)
+            GLib.idle_add(ver_combo.set_sensitive, False)
+            GLib.idle_add(cmd_entry.set_editable, False)
+
+            import subprocess as sp
+            self._dl_watching = True
+            watcher = threading.Thread(target=_watch_progress, daemon=True)
+            watcher.start()
+
+            try:
+                self._dl_process = sp.Popen(
+                    cmd,
+                    stdout=sp.DEVNULL, stderr=sp.DEVNULL,
+                    cwd=self.vms_dir
+                )
+                self._dl_process.wait()
+                rc = self._dl_process.returncode
+            except Exception:
+                rc = 1
+
+            self._dl_watching = False
+            import time as _time
+            _time.sleep(1.2)  # wait for watcher thread to finish its last iteration
+
+            if self._dl_cancelled:
+                GLib.idle_add(progress.set_text, "Cancelled")
+                GLib.idle_add(progress.set_fraction, 0)
+            elif rc == 0:
+                GLib.idle_add(progress.set_fraction, 1.0)
+                GLib.idle_add(progress.set_text, "Download complete!")
+                GLib.idle_add(dl_btn.set_label, "Done — Close")
+                GLib.idle_add(dl_btn.set_sensitive, True)
+                GLib.idle_add(self._refresh)
+            else:
+                GLib.idle_add(progress.set_text, "Download failed.")
+                GLib.idle_add(dl_btn.set_label, "Close")
+                GLib.idle_add(dl_btn.set_sensitive, True)
+
+        def _on_download(btn):
+            if btn.get_label() in ("Done — Close", "Close"):
+                dlg.destroy()
+                return
+            threading.Thread(target=_run_download, daemon=True).start()
+
+        def _on_cancel(btn):
+            if self._dl_process and self._dl_process.poll() is None:
+                self._dl_cancelled = True
+                self._dl_process.terminate()
+            dlg.destroy()
+
+        dl_btn.connect("clicked", _on_download)
+        cancel_btn.connect("clicked", _on_cancel)
+        dlg.connect("destroy", lambda d: _on_cancel(cancel_btn))
+
+        dlg.run()
+
+
+    def _dlg_custom(self, *_):
+        # ask for VM name
+        name_dlg = Gtk.Dialog(title="Create Custom VM", parent=self, flags=0)
+        name_dlg.set_default_size(380, 140)
+        name_dlg.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Next", Gtk.ResponseType.OK)
+        nb = name_dlg.get_content_area()
+        nb.set_spacing(8); nb.set_margin_top(16); nb.set_margin_bottom(16)
+        nb.set_margin_start(16); nb.set_margin_end(16)
+        nb.pack_start(Gtk.Label(label="Enter a name for the new VM:"), False, False, 0)
+        name_entry = Gtk.Entry()
+        name_entry.set_text("My custom VM")
+        nb.pack_start(name_entry, False, False, 0)
+        name_dlg.show_all()
+        r = name_dlg.run()
+        vm_name = name_entry.get_text().strip()
+        name_dlg.destroy()
+        if r != Gtk.ResponseType.OK or not vm_name:
+            return
+
+        dest_name = vm_name.replace(" ", "-").lower()
+        dest_dir  = Path(self.vms_dir) / dest_name
+        dest_conf = Path(self.vms_dir) / f"{dest_name}.conf"
+        if dest_dir.exists():
+            self._warn("Already exists", f"VM '{dest_name}' already exists.")
+            return
+
+        # pick ISO or IMG
+        fc = Gtk.FileChooserDialog(title="Select ISO or IMG file", parent=self,
+                                   action=Gtk.FileChooserAction.OPEN)
+        fc.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+        fc.set_current_folder(str(Path.home() / "Downloads"))
+        filt = Gtk.FileFilter()
+        filt.set_name("Disk images (*.iso, *.img)")
+        filt.add_pattern("*.iso"); filt.add_pattern("*.ISO")
+        filt.add_pattern("*.img"); filt.add_pattern("*.IMG")
+        fc.add_filter(filt)
+        r2 = fc.run()
+        src_path = fc.get_filename()
+        fc.destroy()
+        if r2 != Gtk.ResponseType.OK or not src_path:
+            return
+
+        src_path = Path(src_path)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Assign SSH port upfront
+        ssh_port = get_next_ssh_port(self.vms_dir, dest_name)
+
+        if src_path.suffix.lower() == ".img":
+            # convert raw img to qcow2
+            notify("quickbox-gui", f"Converting {src_path.name} to qcow2…", "low")
+            def _convert():
+                disk = str(dest_dir / "disk.qcow2")
+                subprocess.run(["qemu-img", "convert", "-f", "raw", "-O", "qcow2",
+                                 str(src_path), disk])
+                subprocess.run(["qemu-img", "resize", disk, "20G"])
+                conf_text = (f"#!/usr/bin/quickemu --vm\n"
+                             f"guest_os=\"linux\"\n"
+                             f"disk_img=\"{dest_name}/disk.qcow2\"\n"
+                             f"iso=\"\"\n"
+                             f"pretty=\"{vm_name}\"\n"
+                             f"ssh_port=\"{ssh_port}\"\n"
+                             f"boot=legacy\n"
+                             f"compat_mode=true\n"
+                             f"disk_if=ide\n"
+                             f"net_device=e1000\n")
+                dest_conf.write_text(conf_text)
+                dest_conf.chmod(0o755)
+                notify("quickbox-gui", f"VM <b>{vm_name}</b> created!", "low")
+                GLib.idle_add(self._refresh)
+            threading.Thread(target=_convert, daemon=True).start()
+        else:
+            # copy ISO
+            notify("quickbox-gui", f"Copying {src_path.name}…", "low")
+            def _copy():
+                shutil.copy2(str(src_path), str(dest_dir / src_path.name))
+                conf_text = (f"#!/usr/bin/quickemu --vm\n"
+                             f"guest_os=\"linux\"\n"
+                             f"disk_img=\"{dest_name}/disk.qcow2\"\n"
+                             f"iso=\"{dest_name}/{src_path.name}\"\n"
+                             f"pretty=\"{vm_name}\"\n"
+                             f"ssh_port=\"{ssh_port}\"\n")
+                dest_conf.write_text(conf_text)
+                dest_conf.chmod(0o755)
+                notify("quickbox-gui", f"VM <b>{vm_name}</b> created!", "low")
+                GLib.idle_add(self._refresh)
+            threading.Thread(target=_copy, daemon=True).start()
+
+    # ── Advanced dialog ──
+
+    def _dlg_advanced(self, *_):
+        dlg = Gtk.Dialog(title="Advanced", parent=self, flags=0)
+        dlg.set_default_size(480, 540)
+        dlg.add_buttons("Close", Gtk.ResponseType.CLOSE)
+        box = dlg.get_content_area()
+        box.set_spacing(0)
+        box.set_margin_top(16); box.set_margin_bottom(24)
+        box.set_margin_start(16); box.set_margin_end(16)
+
+        # Current vms_dir
+        loc_lbl = Gtk.Label()
+        loc_lbl.set_markup(f'<b>Current VMs directory:</b>\n<span size="small" color="gray">{self.vms_dir}</span>')
+        loc_lbl.set_halign(Gtk.Align.START)
+        loc_lbl.set_margin_bottom(12)
+        box.pack_start(loc_lbl, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 8)
+
+        # ── Location management ──
+        hdr1 = Gtk.Label(label="LOCATION MANAGEMENT")
+        hdr1.set_halign(Gtk.Align.START)
+        hdr1.get_style_context().add_class("section-hdr")
+        box.pack_start(hdr1, False, False, 0)
+
+        btn_grid = Gtk.Grid()
+        btn_grid.set_column_spacing(8)
+        btn_grid.set_row_spacing(8)
+        btn_grid.set_margin_top(8)
+
+        migrate_btn = Gtk.Button(label="Migrate VMs to new location")
+        migrate_btn.connect("clicked", lambda b: self._do_migrate(dlg))
+        btn_grid.attach(migrate_btn, 0, 0, 2, 1)
+
+        add_btn = Gtk.Button(label="Add to switch list")
+        add_btn.connect("clicked", lambda b: self._do_add_loc(dlg))
+        btn_grid.attach(add_btn, 0, 1, 2, 1)
+
+        box.pack_start(btn_grid, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 8)
+
+        # ── Distro list management ──
+        hdr_distro = Gtk.Label(label="DISTRO LIST MANAGEMENT")
+        hdr_distro.set_halign(Gtk.Align.START)
+        hdr_distro.get_style_context().add_class("section-hdr")
+        box.pack_start(hdr_distro, False, False, 0)
+
+        update_btn = Gtk.Button(label="Update Distro List from quickget")
+        update_btn.set_margin_top(8)
+        update_btn.connect("clicked", lambda b: _update_distro_list(self))
+        box.pack_start(update_btn, False, False, 0)
+
+        upd_info = Gtk.Label()
+        upd_info.set_markup('<span size="small" color="gray">Updates ~/.config/quickbox/quickinst.csv (takes ~30s)</span>')
+        upd_info.set_halign(Gtk.Align.START)
+        upd_info.set_margin_bottom(12)
+        box.pack_start(upd_info, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 8)
+        hdr2 = Gtk.Label(label="SAVED LOCATIONS (click to switch)")
+        hdr2.set_halign(Gtk.Align.START)
+        hdr2.get_style_context().add_class("section-hdr")
+        box.pack_start(hdr2, False, False, 0)
+
+        self._loc_list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self._loc_list_box.set_margin_top(4)
+        self._refresh_loc_list(dlg)
+        box.pack_start(self._loc_list_box, False, False, 0)
+
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    def _refresh_loc_list(self, dlg):
+        for c in self._loc_list_box.get_children():
+            self._loc_list_box.remove(c)
+        conf = read_conf()
+        found = False
+        for i in range(1, 6):
+            loc = conf.get(f"vms_dir_{i}", "")
+            if loc:
+                found = True
+                is_current = (loc == self.vms_dir)
+                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                lbl = Gtk.Label(label=("✓ " if is_current else "   ") + loc)
+                lbl.set_halign(Gtk.Align.START)
+                lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                lbl.set_max_width_chars(36)
+                row.pack_start(lbl, True, True, 0)
+
+                sw_btn = Gtk.Button(label="Switch")
+                sw_btn.set_size_request(70, -1)
+                sw_btn.set_sensitive(not is_current)
+                if not is_current:
+                    sw_btn.connect("clicked", lambda b, l=loc: self._switch_loc(l, dlg))
+                row.pack_end(sw_btn, False, False, 0)
+
+                rm_btn = Gtk.Button(label="Remove")
+                rm_btn.set_size_request(70, -1)
+                rm_btn.connect("clicked", lambda b, idx=i: self._remove_loc(idx, dlg))
+                row.pack_end(rm_btn, False, False, 0)
+
+                self._loc_list_box.pack_start(row, False, False, 0)
+        if not found:
+            nl = Gtk.Label(label="No saved locations yet")
+            nl.get_style_context().add_class("dim-label")
+            nl.set_halign(Gtk.Align.START)
+            self._loc_list_box.pack_start(nl, False, False, 0)
+        self._loc_list_box.show_all()
+
+    def _switch_loc(self, loc, dlg):
+        setconf("vms_dir", loc)
+        self.vms_dir = loc
+        self._refresh_loc_list(dlg)
+        self._headerbar.set_subtitle(loc)
+        self._refresh()
+
+    def _remove_loc(self, idx, dlg):
+        remove_key(f"vms_dir_{idx}", CONFIG_FILE)
+        self._refresh_loc_list(dlg)
+
+    def _do_migrate(self, dlg):
+        # Step 1: pick which VMs to migrate
+        vms = get_vms(self.vms_dir)
+        if not vms:
+            self._warn("No VMs", "There are no VMs in the current location.")
+            return
+
+        pick = Gtk.Dialog(title="Select VMs to migrate", parent=self, flags=0)
+        pick.set_default_size(440, 480)
+        pick.add_buttons("Cancel", Gtk.ResponseType.CANCEL,
+                         "Next", Gtk.ResponseType.OK)
+        pb = pick.get_content_area()
+        pb.set_spacing(8)
+        pb.set_margin_top(14); pb.set_margin_bottom(14)
+        pb.set_margin_start(14); pb.set_margin_end(14)
+
+        info = Gtk.Label()
+        info.set_markup('<span size="small" color="gray">Tick the VMs you want to copy to the new location.</span>')
+        info.set_halign(Gtk.Align.START)
+        pb.pack_start(info, False, False, 0)
+
+        # Select all / none
+        sel_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        all_btn  = Gtk.Button(label="Select all")
+        none_btn = Gtk.Button(label="Select none")
+        sel_box.pack_start(all_btn, False, False, 0)
+        sel_box.pack_start(none_btn, False, False, 0)
+        pb.pack_start(sel_box, False, False, 0)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        list_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        scroll.add(list_box)
+        pb.pack_start(scroll, True, True, 0)
+
+        checks = []
+        for vm in vms:
+            running_tag = "  [running]" if vm["_running"] else ""
+            cb = Gtk.CheckButton(label=f"{vm['_pretty']}  ({vm['_size']}){running_tag}")
+            cb._vm = vm
+            cb.set_sensitive(not vm["_running"])
+            cb.set_tooltip_text("Stop the VM before migrating" if vm["_running"]
+                                else f"{vm['_name']}")
+            list_box.pack_start(cb, False, False, 0)
+            checks.append(cb)
+
+        all_btn.connect("clicked",
+            lambda b: [c.set_active(True) for c in checks if c.get_sensitive()])
+        none_btn.connect("clicked",
+            lambda b: [c.set_active(False) for c in checks])
+
+        pick.show_all()
+        r = pick.run()
+        selected = [c._vm for c in checks if c.get_active() and c.get_sensitive()]
+        pick.destroy()
+
+        if r != Gtk.ResponseType.OK or not selected:
+            return
+
+        # Step 2: pick destination
+        dest = self._pick_dir("Select destination for migration", str(Path.home()))
+        if not dest:
+            return
+        newdir = str(Path(dest) / "emu")
+        if newdir == self.vms_dir:
+            self._warn("Same location", "Destination is the same as current.")
+            return
+
+        names = "\n  • ".join(v["_pretty"] for v in selected)
+        if not self._confirm(
+            "Start migration?",
+            f"Copy {len(selected)} VM(s) to:\n{newdir}\n\n  • {names}\n\n"
+            f"Originals will remain unless you confirm removal afterwards."
+        ):
+            return
+
+        Path(newdir).mkdir(parents=True, exist_ok=True)
+
+        # Build rsync arg list: each VM dir + its .conf file
+        rsync_cmd = ["rsync", "-a", "--info=progress2"]
+        for vm in selected:
+            vm_dir = str(Path(self.vms_dir) / vm["_name"])
+            if Path(vm_dir).exists():
+                rsync_cmd.append(vm_dir)
+            rsync_cmd.append(vm["_conf"])
+        rsync_cmd.append(f"{newdir}/")
+
+        def _migration_done(ok):
+            if not ok:
+                self._warn("Migration failed", "rsync returned an error.")
+                return
+            if self._confirm_danger(
+                "Remove original files?",
+                f"Migration succeeded.\n\n"
+                f"Do you want to PERMANENTLY DELETE the {len(selected)} "
+                f"migrated VM(s) from the original location?\n\n"
+                f"{self.vms_dir}\n\n"
+                f"This cannot be undone. The copies in the new location will remain."
+            ):
+                for vm in selected:
+                    vm_dir = Path(self.vms_dir) / vm["_name"]
+                    if vm_dir.exists():
+                        shutil.rmtree(str(vm_dir))
+                    if Path(vm["_conf"]).exists():
+                        Path(vm["_conf"]).unlink()
+            self._refresh()
+            self._refresh_loc_list(dlg)
+
+        self._run_with_progress(
+            f"Migrating {len(selected)} VM(s)",
+            rsync_cmd,
+            on_done=_migration_done
+        )
+
+    def _do_add_loc(self, dlg):
+        loc = self._pick_dir("Select directory to add to switch list", str(Path.home()))
+        if not loc:
+            return
+        conf = read_conf()
+        for i in range(1, 6):
+            if not conf.get(f"vms_dir_{i}"):
+                setconf(f"vms_dir_{i}", loc)
+                self._refresh_loc_list(dlg)
+                return
+        self._warn("List full", "Maximum 5 saved locations. Remove one first.")
+
+    # ── dialogs helpers ──
+
+    def _run_with_progress(self, title, cmd_list, cwd=None, on_done=None):
+        """Run a command in a background thread with a GUI progress dialog."""
+        dlg = Gtk.Dialog(title=title, parent=self, flags=0)
+        dlg.set_default_size(460, 160)
+        dlg.set_deletable(False)
+        box = dlg.get_content_area()
+        box.set_margin_top(16); box.set_margin_bottom(16)
+        box.set_margin_start(16); box.set_margin_end(16)
+        box.set_spacing(10)
+
+        status_lbl = Gtk.Label(label="Please wait…")
+        status_lbl.set_halign(Gtk.Align.START)
+        box.pack_start(status_lbl, False, False, 0)
+
+        progress = Gtk.ProgressBar()
+        progress.set_show_text(False)
+        box.pack_start(progress, False, False, 0)
+
+        note = Gtk.Label()
+        note.set_markup('<span size="small" color="gray">This may take a while depending on size.</span>')
+        note.set_halign(Gtk.Align.START)
+        box.pack_start(note, False, False, 0)
+
+        dlg.show_all()
+
+        def _pulse():
+            progress.pulse()
+            return self._proc_running
+
+        self._proc_running = True
+        GLib.timeout_add(150, _pulse)
+
+        def _run():
+            try:
+                proc = subprocess.run(
+                    cmd_list, cwd=cwd,
+                    capture_output=True, text=True
+                )
+                rc = proc.returncode
+            except Exception as e:
+                rc = 1
+
+            self._proc_running = False
+
+            if rc == 0:
+                GLib.idle_add(progress.set_fraction, 1.0)
+                GLib.idle_add(status_lbl.set_text, "Done!")
+                GLib.idle_add(note.set_markup,
+                    '<span size="small" color="gray">Completed successfully.</span>')
+            else:
+                GLib.idle_add(status_lbl.set_text, "Failed.")
+                GLib.idle_add(note.set_markup,
+                    '<span size="small" color="red">Something went wrong.</span>')
+
+            def _finish():
+                dlg.destroy()
+                if on_done:
+                    on_done(rc == 0)
+            GLib.timeout_add(1200, _finish)
+
+        threading.Thread(target=_run, daemon=True).start()
+        dlg.run()
+
+    def _pick_dir(self, title, start):
+        fc = Gtk.FileChooserDialog(title=title, parent=self,
+                                   action=Gtk.FileChooserAction.SELECT_FOLDER)
+        fc.add_buttons("Cancel", Gtk.ResponseType.CANCEL, "Select", Gtk.ResponseType.OK)
+        fc.set_current_folder(start)
+        r = fc.run()
+        path = fc.get_filename() if r == Gtk.ResponseType.OK else None
+        fc.destroy()
+        return path
+
+    def _confirm(self, title, body):
+        dlg = Gtk.MessageDialog(parent=self, flags=0,
+                                message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.YES_NO,
+                                text=title)
+        dlg.format_secondary_text(body)
+        r = dlg.run()
+        dlg.destroy()
+        return r == Gtk.ResponseType.YES
+
+    def _confirm_danger(self, title, body):
+            """Confirmation dialog for destructive actions.
+            
+            Defaults to NO (green/safe). The YES button is styled red as a
+            deliberate visual warning to prevent accidental deletes.
+            """
+            dlg = Gtk.MessageDialog(parent=self, flags=0,
+                                    message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.NONE,
+                                    text=title)
+            dlg.format_secondary_text(body)
+
+            # Green "No, keep files" — safe default
+            no_btn = dlg.add_button("No, keep files", Gtk.ResponseType.NO)
+            no_ctx = no_btn.get_style_context()
+            no_ctx.add_class("suggested-action")  # GTK green accent
+
+            # Red "Yes, delete" — destructive
+            yes_btn = dlg.add_button("Yes, delete originals", Gtk.ResponseType.YES)
+            yes_ctx = yes_btn.get_style_context()
+            yes_ctx.add_class("destructive-action")  # GTK red accent
+
+            # Make NO the default (Enter key = safe choice)
+            dlg.set_default_response(Gtk.ResponseType.NO)
+
+            r = dlg.run()
+            dlg.destroy()
+            return r == Gtk.ResponseType.YES
+
+    def _warn(self, title, body):
+        dlg = Gtk.MessageDialog(parent=self, flags=0,
+                                message_type=Gtk.MessageType.WARNING,
+                                buttons=Gtk.ButtonsType.OK,
+                                text=title)
+        dlg.format_secondary_text(body)
+        dlg.run()
+        dlg.destroy()
+
+
+# ── entry point ───────────────────────────────────────────────────────────────
+
+# ─── Quickget distro list updater ────────────────────────────────────────────
+
+def _update_distro_list(parent_win):
+    """Background thread to update ~/.config/quickbox/quickinst.csv from quickget --list"""
+    import subprocess
+    
+    wait_win = None  # Initialize outside so it's available to all inner functions
+    
+    def run_update():
+        nonlocal wait_win  # Allow modifying wait_win from nested scope
+        try:
+            # Run quickget --list in subprocess
+            result = subprocess.run(["quickget", "--list"], 
+                                  capture_output=True, text=True, timeout=60)
+            
+            if result.returncode != 0:
+                GLib.idle_add(lambda: notify("Distro List", 
+                                            f"✗ Error: {result.stderr[:100]}", "critical"))
+                return
+            
+            # Parse output and build CSV: distro release [option] -> name,quickget cmd
+            lines = result.stdout.strip().split('\n')
+            csv_path = Path.home() / ".config/quickbox/quickinst.csv"
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            csv_lines = []
+            for i, line in enumerate(lines):
+                line = line.strip()
+                
+                # Skip header (first line) and empty lines
+                if i == 0 or not line:
+                    continue
+                
+                # Parse space-separated: distro release [option]
+                parts = line.split()
+                if len(parts) >= 2:
+                    # Build display name: capitalize distro, keep release/option as-is
+                    distro = parts[0].capitalize()
+                    rest = ' '.join(parts[1:])
+                    display_name = f"{distro} {rest}".strip()
+                    
+                    # Build quickget command: lowercase, space-separated
+                    cmd = f"quickget {' '.join(parts).lower()}"
+                    
+                    csv_lines.append(f"{display_name},{cmd}")
+            
+            if not csv_lines:
+                GLib.idle_add(lambda: notify("Distro List", 
+                                            "⚠ No distros found in output", "normal"))
+                return
+            
+            # Write CSV - make sure we preserve the data
+            try:
+                csv_path.write_text('\n'.join(csv_lines) + '\n')
+                GLib.idle_add(lambda: notify("Distro List", 
+                                            f"✓ Updated {len(csv_lines)} distros", "low"))
+            except Exception as e:
+                GLib.idle_add(lambda: notify("Distro List", 
+                                            f"✗ Failed to write CSV: {str(e)[:80]}", "critical"))
+                
+        except subprocess.TimeoutExpired:
+            GLib.idle_add(lambda: notify("Distro List", 
+                                        "✗ Timeout (>60s)", "critical"))
+        except FileNotFoundError:
+            GLib.idle_add(lambda: notify("Distro List", 
+                                        "✗ quickget not found. Install quickemu.", "critical"))
+        except Exception as e:
+            GLib.idle_add(lambda: notify("Distro List", 
+                                        f"✗ Error: {str(e)[:80]}", "critical"))
+        finally:
+            # Safely destroy wait_win
+            if wait_win:
+                GLib.idle_add(lambda: wait_win.destroy() if wait_win else None)
+    
+    # Create wait window (non-blocking)
+    wait_win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+    wait_win.set_transient_for(parent_win)
+    wait_win.set_modal(True)
+    wait_win.set_keep_above(True)
+    wait_win.set_decorated(False)
+    wait_win.set_default_size(300, 80)
+    wait_win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+    
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+    box.set_margin_top(16)
+    box.set_margin_bottom(16)
+    box.set_margin_start(16)
+    box.set_margin_end(16)
+    
+    lbl = Gtk.Label(label="Updating distro list...")
+    lbl.set_line_wrap(True)
+    box.pack_start(lbl, True, True, 0)
+    
+    spinner = Gtk.Spinner()
+    spinner.start()
+    box.pack_start(spinner, False, False, 0)
+    
+    wait_win.add(box)
+    wait_win.show_all()
+    
+    # Start update in background thread
+    t = threading.Thread(target=run_update, daemon=True)
+    t.start()
+
+
+def main():
+    win = QuickboxWindow()
+    win.show_all()
+    Gtk.main()
+
+if __name__ == "__main__":
+    main()

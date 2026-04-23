@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Quickbox
+Comment=QEMU/quickemu Virtual Machine Manager
+Exec=quickbox-launch
+Icon=qemu
+Categories=System;Emulator;
+Terminal=false
+StartupNotify=true
+StartupWMClass=Quickbox
