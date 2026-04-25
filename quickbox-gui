@@ -87,37 +87,60 @@ OVMF_VARS_TEMPLATE = next((p for p in [
 ] if p.exists()), None)
 
 # ─── VM launch profiles ───────────────────────────────────────────────────────
-# Each profile writes a set of keys into the VM .conf file.
-# Keys managed by profiles: ram, cpu_cores, live_mode, headless, net_device, compat_mode
-PROFILES = {
-    "standard": {
-        "label": "Standard",
-        "desc": "Default setup — auto-detect boot, disk created on first launch.",
-        "settings": {},
-    },
-    "live_iso": {
-        "label": "Live ISO",
-        "desc": "Boot fresh from ISO every time. No disk created or needed.",
-        "settings": {"live_mode": "true"},
-    },
-    "lightweight": {
-        "label": "Lightweight",
-        "desc": "2 GB RAM, 2 CPU cores, minimal QEMU. For low-resource hosts.",
-        "settings": {"ram": "2G", "cpu_cores": "2", "compat_mode": "true"},
-    },
-    "performance": {
-        "label": "Performance",
-        "desc": "8 GB RAM, 4 CPU cores, VirtIO drivers for maximum speed.",
-        "settings": {"ram": "8G", "cpu_cores": "4", "net_device": "virtio-net-pci"},
-    },
-    "server": {
-        "label": "Server / Headless",
-        "desc": "No display window. 4 GB RAM, VirtIO network. SSH access only.",
-        "settings": {"ram": "4G", "cpu_cores": "2", "net_device": "virtio-net-pci", "headless": "true"},
-    },
-}
-# All keys that any profile can write — cleared on profile switch
-_PROFILE_KEYS = {"ram", "cpu_cores", "live_mode", "headless", "net_device", "compat_mode"}
+# Profiles live in ~/.config/quickbox/profiles/*.conf (key=value format).
+# Special keys: label, desc, order — everything else is written to the VM conf.
+# Users can add/edit files freely; defaults are restored with Reset in Advanced.
+
+PROFILES_DIR = Path.home() / ".config/quickbox/profiles"
+_PROFILE_META = {"label", "desc", "order"}
+
+_DEFAULT_PROFILES = [
+    ("standard",    1, "Standard",        "Default setup — UEFI boot, disk created on first launch.", {}),
+    ("live_iso",    2, "Live ISO",         "Boot fresh from ISO every time. No disk created or needed.", {"live_mode": "true"}),
+    ("lightweight", 3, "Lightweight",     "2 GB RAM, 2 CPU cores, minimal QEMU. For low-resource hosts.", {"ram": "2G", "cpu_cores": "2", "compat_mode": "true"}),
+    ("performance", 4, "Performance",     "8 GB RAM, 4 CPU cores, VirtIO drivers for maximum speed.", {"ram": "8G", "cpu_cores": "4", "net_device": "virtio-net-pci"}),
+    ("server",      5, "Server / Headless", "No display window. 4 GB RAM, VirtIO network. SSH access only.", {"ram": "4G", "cpu_cores": "2", "net_device": "virtio-net-pci", "headless": "true"}),
+]
+
+
+def write_default_profiles(overwrite=False):
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    for pid, order, label, desc, settings in _DEFAULT_PROFILES:
+        f = PROFILES_DIR / f"{pid}.conf"
+        if f.exists() and not overwrite:
+            continue
+        lines = [f"label={label}", f"desc={desc}", f"order={order}"]
+        for k, v in settings.items():
+            lines.append(f"{k}={v}")
+        f.write_text("\n".join(lines) + "\n")
+
+
+def load_profiles():
+    entries = []
+    for f in sorted(PROFILES_DIR.glob("*.conf")):
+        data = {}
+        try:
+            for line in f.read_text().splitlines():
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    data[k.strip()] = v.strip()
+        except Exception:
+            continue
+        pid = f.stem
+        label = data.get("label", pid)
+        desc = data.get("desc", "")
+        order = int(data.get("order", "999"))
+        settings = {k: v for k, v in data.items() if k not in _PROFILE_META}
+        entries.append((order, pid, {"label": label, "desc": desc, "settings": settings}))
+    entries.sort(key=lambda x: (x[0], x[1]))
+    return {pid: profile for _, pid, profile in entries}
+
+
+write_default_profiles()
+PROFILES = load_profiles()
+# All keys that any loaded profile can write — used to clean up on profile switch
+_PROFILE_KEYS = {key for p in PROFILES.values() for key in p["settings"]}
 
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
@@ -1330,6 +1353,13 @@ TIPS
         # Refresh panel so switches (e.g. compat_mode) reflect new profile state
         self._show_panel(vm)
 
+    def _reset_default_profiles(self):
+        global PROFILES, _PROFILE_KEYS
+        write_default_profiles(overwrite=True)
+        PROFILES = load_profiles()
+        _PROFILE_KEYS = {key for p in PROFILES.values() for key in p["settings"]}
+        notify("quickbox-gui", "Default profiles restored.", "low")
+
     # ── snapshots ──
 
     def _snap_create(self, vm):
@@ -2119,6 +2149,38 @@ TIPS
         upd_info.set_margin_bottom(12)
         box.pack_start(upd_info, False, False, 0)
         box.pack_start(Gtk.Separator(), False, False, 8)
+
+        # ── Profiles management ──
+        hdr_prof = Gtk.Label(label="PROFILES MANAGEMENT")
+        hdr_prof.set_halign(Gtk.Align.START)
+        hdr_prof.get_style_context().add_class("section-hdr")
+        box.pack_start(hdr_prof, False, False, 0)
+
+        prof_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        prof_btn_box.set_margin_top(8)
+        prof_btn_box.set_margin_bottom(4)
+
+        open_prof_btn = Gtk.Button(label="Open profiles folder")
+        open_prof_btn.set_tooltip_text(str(PROFILES_DIR))
+        open_prof_btn.connect("clicked", lambda b: subprocess.Popen(["xdg-open", str(PROFILES_DIR)]))
+        prof_btn_box.pack_start(open_prof_btn, False, False, 0)
+
+        reset_prof_btn = Gtk.Button(label="Reset default profiles")
+        reset_prof_btn.set_tooltip_text("Restore the 5 built-in profiles (Standard, Live ISO, Lightweight, Performance, Server). Custom profiles are kept.")
+        reset_prof_btn.connect("clicked", lambda b: self._reset_default_profiles())
+        prof_btn_box.pack_start(reset_prof_btn, False, False, 0)
+
+        box.pack_start(prof_btn_box, False, False, 0)
+
+        prof_info = Gtk.Label()
+        prof_info.set_markup(f'<span size="small" color="gray">Add or edit .conf files in {PROFILES_DIR} to create custom profiles.</span>')
+        prof_info.set_halign(Gtk.Align.START)
+        prof_info.set_line_wrap(True)
+        prof_info.set_max_width_chars(52)
+        prof_info.set_margin_bottom(12)
+        box.pack_start(prof_info, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 8)
+
         hdr2 = Gtk.Label(label="SAVED LOCATIONS (click to switch)")
         hdr2.set_halign(Gtk.Align.START)
         hdr2.get_style_context().add_class("section-hdr")
