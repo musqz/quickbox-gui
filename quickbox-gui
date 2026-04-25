@@ -920,6 +920,29 @@ TIPS
         except Exception:
             self._warn("SSH Error", f"Could not copy to clipboard. Use:\n\n{ssh_cmd}")
 
+    def _test_ssh(self, vm, btn):
+        port = int(vm.get("ssh_port", "2222"))
+        btn.set_sensitive(False)
+        btn.set_label("Testing…")
+
+        def do_test():
+            try:
+                with socket.create_connection(("localhost", port), timeout=3):
+                    pass
+                reachable = True
+            except Exception:
+                reachable = False
+            GLib.idle_add(lambda: _show_result(reachable))
+
+        def _show_result(ok):
+            if ok:
+                btn.set_label("Reachable")
+                btn.get_style_context().add_class("launch-btn")
+            else:
+                btn.set_label("Not reachable")
+            btn.set_sensitive(True)
+
+        threading.Thread(target=do_test, daemon=True).start()
 
         # ── VM detail panel ──
 
@@ -965,15 +988,32 @@ TIPS
         # SSH section — only when VM is running
         if vm["_running"]:
             self.right_box.pack_start(self._section("SSH"), False, False, 0)
-            ssh_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            
-            copy_btn = Gtk.Button(label="Copy SSH cmd")
+
+            self._ensure_ssh_config(vm)
+            ssh_user = vm.get("ssh_user", "root")
+            ssh_port = vm.get("ssh_port", "2222")
+            ssh_cmd_str = f"ssh -p {ssh_port} {ssh_user}@localhost"
+
+            cmd_lbl = Gtk.Label()
+            cmd_lbl.set_markup(f'<span font_family="monospace">{ssh_cmd_str}</span>')
+            cmd_lbl.set_halign(Gtk.Align.START)
+            cmd_lbl.set_selectable(True)
+            self.right_box.pack_start(cmd_lbl, False, False, 2)
+
+            ssh_btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+            copy_btn = Gtk.Button(label="Copy")
             copy_btn.get_style_context().add_class("ssh-btn")
-            copy_btn.set_tooltip_text("Copy SSH command to clipboard for manual use")
+            copy_btn.set_tooltip_text("Copy SSH command to clipboard")
             copy_btn.connect("clicked", lambda b: self._ssh_copy_cmd(vm))
-            ssh_box.pack_start(copy_btn, False, False, 0)
-            
-            self.right_box.pack_start(ssh_box, False, False, 6)
+            ssh_btn_box.pack_start(copy_btn, False, False, 0)
+
+            test_btn = Gtk.Button(label="Test SSH")
+            test_btn.set_tooltip_text("Check if SSH port is reachable on localhost")
+            test_btn.connect("clicked", lambda b, tb=test_btn: self._test_ssh(vm, tb))
+            ssh_btn_box.pack_start(test_btn, False, False, 0)
+
+            self.right_box.pack_start(ssh_btn_box, False, False, 4)
 
         # Info
         self.right_box.pack_start(self._section("INFO"), False, False, 0)
@@ -983,6 +1023,7 @@ TIPS
         infos = [
             ("Guest OS",  vm.get("guest_os", "linux")),
             ("Boot mode", vm.get("boot", "uefi")),
+            ("SSH port",  vm.get("ssh_port", "—") or "—"),
             ("Disk",      vm.get("disk_img", "—")),
             ("ISO",       vm.get("iso", "—") or "—"),
         ]
