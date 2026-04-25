@@ -86,6 +86,39 @@ OVMF_VARS_TEMPLATE = next((p for p in [
     Path("/usr/share/OVMF/OVMF_VARS.fd"),
 ] if p.exists()), None)
 
+# ─── VM launch profiles ───────────────────────────────────────────────────────
+# Each profile writes a set of keys into the VM .conf file.
+# Keys managed by profiles: ram, cpu_cores, live_mode, headless, net_device, compat_mode
+PROFILES = {
+    "standard": {
+        "label": "Standard",
+        "desc": "Default setup — auto-detect boot, disk created on first launch.",
+        "settings": {},
+    },
+    "live_iso": {
+        "label": "Live ISO",
+        "desc": "Boot fresh from ISO every time. No disk created or needed.",
+        "settings": {"live_mode": "true"},
+    },
+    "lightweight": {
+        "label": "Lightweight",
+        "desc": "2 GB RAM, 2 CPU cores, minimal QEMU. For low-resource hosts.",
+        "settings": {"ram": "2G", "cpu_cores": "2", "compat_mode": "true"},
+    },
+    "performance": {
+        "label": "Performance",
+        "desc": "8 GB RAM, 4 CPU cores, VirtIO drivers for maximum speed.",
+        "settings": {"ram": "8G", "cpu_cores": "4", "net_device": "virtio-net-pci"},
+    },
+    "server": {
+        "label": "Server / Headless",
+        "desc": "No display window. 4 GB RAM, VirtIO network. SSH access only.",
+        "settings": {"ram": "4G", "cpu_cores": "2", "net_device": "virtio-net-pci", "headless": "true"},
+    },
+}
+# All keys that any profile can write — cleared on profile switch
+_PROFILE_KEYS = {"ram", "cpu_cores", "live_mode", "headless", "net_device", "compat_mode"}
+
 
 # ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -958,18 +991,38 @@ TIPS
             sw.connect("notify::active", callback)
             return lbl, sw
 
+        # Profile chooser row
+        pl = Gtk.Label(label="Profile:")
+        pl.set_halign(Gtk.Align.END)
+        pl.get_style_context().add_class("dim-label")
+        pc = Gtk.ComboBoxText()
+        for pid, profile in PROFILES.items():
+            pc.append(pid, profile["label"])
+        cur_profile = vm.get("vm_profile", "standard")
+        pc.set_active_id(cur_profile if cur_profile in PROFILES else "standard")
+        profile_desc = Gtk.Label()
+        profile_desc.set_markup(
+            f'<span size="small" color="gray">{PROFILES.get(cur_profile, PROFILES["standard"])["desc"]}</span>'
+        )
+        profile_desc.set_halign(Gtk.Align.START)
+        profile_desc.set_line_wrap(True)
+        profile_desc.set_max_width_chars(42)
+        pc.connect("changed", self._on_profile_changed, profile_desc, vm)
+        sg.attach(pl, 0, 0, 1, 1); sg.attach(pc, 1, 0, 1, 1)
+        sg.attach(profile_desc, 1, 1, 1, 1)
+
         cl, cs = sw_row("Compatibility mode",
                         vm.get("compat_mode") == "true",
                         lambda sw, p, v=vm: setconf("compat_mode",
                             "true" if sw.get_active() else "false", v["_conf"]) or
                             v.update({"compat_mode": "true" if sw.get_active() else "false"}))
-        sg.attach(cl, 0, 0, 1, 1); sg.attach(cs, 1, 0, 1, 1)
+        sg.attach(cl, 0, 2, 1, 1); sg.attach(cs, 1, 2, 1, 1)
         compat_hint = Gtk.Label()
         compat_hint.set_markup('<span size="small" color="gray">Use minimal QEMU without VirGL — for lightweight or older distros that show a blank screen.</span>')
         compat_hint.set_halign(Gtk.Align.START)
         compat_hint.set_line_wrap(True)
         compat_hint.set_max_width_chars(42)
-        sg.attach(compat_hint, 1, 1, 1, 1)
+        sg.attach(compat_hint, 1, 3, 1, 1)
 
         bl = Gtk.Label(label="Boot mode:")
         bl.set_halign(Gtk.Align.END)
@@ -980,20 +1033,20 @@ TIPS
         cur = vm.get("boot", "auto")
         bc.set_active_id(cur if cur in ("uefi","legacy") else "auto")
         bc.connect("changed", self._on_boot_changed, vm)
-        sg.attach(bl, 0, 2, 1, 1); sg.attach(bc, 1, 2, 1, 1)
+        sg.attach(bl, 0, 4, 1, 1); sg.attach(bc, 1, 4, 1, 1)
 
         stl, sts = sw_row("Mark as stable",
                           vm.get("confirmed") == "true",
                           lambda sw, p, v=vm: setconf("confirmed",
                               "true" if sw.get_active() else "false", v["_conf"]) or
                               v.update({"confirmed": "true" if sw.get_active() else "false"}))
-        sg.attach(stl, 0, 3, 1, 1); sg.attach(sts, 1, 3, 1, 1)
+        sg.attach(stl, 0, 5, 1, 1); sg.attach(sts, 1, 5, 1, 1)
         stable_hint = Gtk.Label()
         stable_hint.set_markup('<span size="small" color="gray">When on: hides launch notifications and locks the Danger Zone.</span>')
         stable_hint.set_halign(Gtk.Align.START)
         stable_hint.set_line_wrap(True)
         stable_hint.set_max_width_chars(42)
-        sg.attach(stable_hint, 1, 4, 1, 1)
+        sg.attach(stable_hint, 1, 6, 1, 1)
         self.right_box.pack_start(sg, False, False, 0)
 
         # Snapshots — always show
@@ -1099,6 +1152,10 @@ TIPS
         iso       = vm.get("iso", "")
         disk_path = str(Path(self.vms_dir) / disk_img) if disk_img else ""
         iso_path  = str(Path(self.vms_dir) / iso) if iso else ""
+        ram       = vm.get("ram", "4G")
+        cpu_cores = vm.get("cpu_cores", "2")
+        live_mode = vm.get("live_mode") == "true"
+        headless  = vm.get("headless") == "true"
         
         # Create vmdir if needed
         Path(vmdir).mkdir(parents=True, exist_ok=True)
@@ -1111,8 +1168,8 @@ TIPS
             if not Path(ovmf_vars).exists() and OVMF_VARS_TEMPLATE:
                 shutil.copy(str(OVMF_VARS_TEMPLATE), ovmf_vars)
 
-        # Ensure disk exists
-        if disk_path and not Path(disk_path).exists():
+        # Ensure disk exists (skip in live_mode — boots from ISO only)
+        if disk_path and not Path(disk_path).exists() and not live_mode:
             disk_size = vm.get("disk_size", "32G")
             subprocess.run(["qemu-img", "create", "-f", "qcow2", disk_path, disk_size])
 
@@ -1124,14 +1181,15 @@ TIPS
         notify("quickbox-gui", f"Launching {vmname}", "low")
 
         # Base QEMU args (all modes)
-        # Note: RAM and CPU allocation handled by quickemu wrapper or QEMU defaults
         base_args = [
             "qemu-system-x86_64",
             "-name", f"{vmname},process={vmname}",
             "-machine", f"q35,accel={accel}",
             "-cpu", "host" if KVM_AVAILABLE else "max",
+            "-m", ram,
+            "-smp", cpu_cores,
             "-vga", "std",
-            "-display", "gtk,zoom-to-fit=on",
+            "-display", "none" if headless else "gtk,zoom-to-fit=on",
             "-no-reboot",
         ]
 
@@ -1255,6 +1313,24 @@ TIPS
         else:
             setconf("boot", val, vm["_conf"])
         vm["boot"] = val
+
+    def _on_profile_changed(self, combo, desc_label, vm):
+        pid = combo.get_active_id()
+        if pid is None:
+            return
+        profile = PROFILES.get(pid, PROFILES["standard"])
+        desc_label.set_markup(f'<span size="small" color="gray">{profile["desc"]}</span>')
+        setconf("vm_profile", pid, vm["_conf"])
+        for key in _PROFILE_KEYS:
+            remove_key(key, vm["_conf"])
+        for key, val in profile["settings"].items():
+            setconf(key, val, vm["_conf"])
+        vm["vm_profile"] = pid
+        for key in _PROFILE_KEYS:
+            vm.pop(key, None)
+        vm.update(profile["settings"])
+        # Refresh panel so switches (e.g. compat_mode) reflect new profile state
+        self._show_panel(vm)
 
     # ── snapshots ──
 
