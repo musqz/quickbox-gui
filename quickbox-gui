@@ -959,7 +959,7 @@ TIPS
         grid.set_row_spacing(5)
         infos = [
             ("Guest OS",  vm.get("guest_os", "linux")),
-            ("Boot mode", vm.get("boot", "auto-detect")),
+            ("Boot mode", vm.get("boot", "uefi")),
             ("Disk",      vm.get("disk_img", "—")),
             ("ISO",       vm.get("iso", "—") or "—"),
         ]
@@ -1028,10 +1028,10 @@ TIPS
         bl.set_halign(Gtk.Align.END)
         bl.get_style_context().add_class("dim-label")
         bc = Gtk.ComboBoxText()
-        for bid, blbl in [("auto","Auto-detect"),("uefi","UEFI"),("legacy","Legacy (BIOS)")]:
+        for bid, blbl in [("uefi","UEFI"),("legacy","Legacy (BIOS)")]:
             bc.append(bid, blbl)
-        cur = vm.get("boot", "auto")
-        bc.set_active_id(cur if cur in ("uefi","legacy") else "auto")
+        cur = vm.get("boot", "uefi")
+        bc.set_active_id(cur if cur in ("uefi","legacy") else "uefi")
         bc.connect("changed", self._on_boot_changed, vm)
         sg.attach(bl, 0, 4, 1, 1); sg.attach(bc, 1, 4, 1, 1)
 
@@ -1144,7 +1144,7 @@ TIPS
         vmdir     = str(Path(self.vms_dir) / vmname)
         conf_path = vm["_conf"]
         compat    = vm.get("compat_mode") == "true"
-        boot      = vm.get("boot", "legacy")
+        boot      = vm.get("boot", "uefi")
         confirmed = vm.get("confirmed") == "true"
         disk_if   = vm.get("disk_if", "")
         net_dev   = vm.get("net_device", "e1000")
@@ -1308,11 +1308,9 @@ TIPS
 
     def _on_boot_changed(self, combo, vm):
         val = combo.get_active_id()
-        if val == "auto":
-            remove_key("boot", vm["_conf"])
-        else:
+        if val:
             setconf("boot", val, vm["_conf"])
-        vm["boot"] = val
+            vm["boot"] = val
 
     def _on_profile_changed(self, combo, desc_label, vm):
         pid = combo.get_active_id()
