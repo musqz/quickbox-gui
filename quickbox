@@ -581,16 +581,6 @@ def is_running(vmname):
     return bool(get_vm_pids(vmname))
 
 
-def _pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
 def fmt_size(n):
     for unit in ("B", "K", "M", "G", "T"):
         if n < 1024:
@@ -775,7 +765,7 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         self._timeout_handlers = []
         self._indicator = None
         self._transients = []
-        self._stop_escalated = set()      # VM names whose graceful stop timed out
+        self._stop_escalated = {}          # name -> stalled pids, for VMs whose graceful stop timed out
         self._stop_pending_check = set()  # VM names with a stall-check timer in flight
         self._build_css()
         self._build_ui()
@@ -846,44 +836,47 @@ class QuickboxWindow(Gtk.ApplicationWindow):
 
     STOP_GRACE_MS = 15000  # how long to wait for ACPI shutdown before offering Force Stop
 
-    def _kill_vm_process(self, name, force=False):
+    def _kill_vm_process(self, name, force=False, pids=None, pretty=None):
         import signal as _signal
-        pids = get_vm_pids(name)
+        if pids is None:
+            pids = get_vm_pids(name)
         sig = _signal.SIGKILL if force else _signal.SIGTERM
-        all_signaled = True
         for pid in pids:
             try:
                 os.kill(pid, sig)
             except ProcessLookupError:
                 pass
-            except PermissionError:
-                all_signaled = False
         if force:
-            if all_signaled:
-                self._stop_escalated.discard(name)
+            self._stop_escalated.pop(name, None)
         elif pids and name not in self._stop_pending_check:
             # SIGTERM only requests an ACPI shutdown; guests with no ACPI
             # handler (e.g. live/installer ISO sessions) never react to it.
             # If the original process is still alive after a grace period,
             # offer Force Stop instead of silently escalating to SIGKILL.
             self._stop_pending_check.add(name)
-            GLib.timeout_add(self.STOP_GRACE_MS, self._check_stop_stalled, name, pids)
+            GLib.timeout_add(self.STOP_GRACE_MS, self._check_stop_stalled,
+                              name, pids, pretty or name)
 
-    def _check_stop_stalled(self, name, pids):
+    def _check_stop_stalled(self, name, pids, pretty):
         self._stop_pending_check.discard(name)
-        if any(_pid_alive(p) for p in pids):
-            self._stop_escalated.add(name)
+        # Re-resolve by name rather than signal-probing the raw pids: a bare
+        # os.kill(pid, 0) can't tell the original qemu process apart from an
+        # unrelated process that reused the same pid during the grace period.
+        stalled = [p for p in pids if p in get_vm_pids(name)]
+        if stalled:
+            self._stop_escalated[name] = stalled
             if self.current_vm and self.current_vm["_name"] == name:
                 self._show_panel(self.current_vm)
             else:
-                notify("quickbox", S["ntf_stop_stalled"].format(name), "normal")
+                notify("quickbox", S["ntf_stop_stalled"].format(pretty), "normal")
         return False
 
     def _force_stop_vm(self, vm):
         def on_confirm(yes):
             if not yes:
                 return
-            self._kill_vm_process(vm["_name"], force=True)
+            self._kill_vm_process(vm["_name"], force=True,
+                                   pids=self._stop_escalated.get(vm["_name"]))
             GLib.timeout_add(1000, self._refresh)
         self._confirm_danger(
             S["dlg_force_stop_t"].format(vm["_pretty"]),
@@ -894,7 +887,8 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         def on_confirm(yes):
             if not yes:
                 return
-            self._kill_vm_process(name)
+            pretty = next((v["_pretty"] for v in self.vms if v["_name"] == name), name)
+            self._kill_vm_process(name, pretty=pretty)
             GLib.timeout_add(2500, self._refresh)
         self._tray_show()
         self._confirm(S["dlg_stop_t"].format(name), S["dlg_stop_b"], on_confirm)
@@ -1215,8 +1209,13 @@ class QuickboxWindow(Gtk.ApplicationWindow):
             self.listbox.remove(row)
         self.vms = get_vms(self.vms_dir)
         if self._stop_escalated:
+            # Only prune entries for VMs in the currently loaded location;
+            # switching locations must not drop escalated state for VMs
+            # elsewhere that are still hung.
+            current_names = {v["_name"] for v in self.vms}
             still_running = {v["_name"] for v in self.vms if v["_running"]}
-            self._stop_escalated &= still_running
+            self._stop_escalated = {n: p for n, p in self._stop_escalated.items()
+                                     if n not in current_names or n in still_running}
         used = {int(v["ssh_port"]) for v in self.vms
                 if v.get("ssh_port") and v["ssh_port"].isdigit()}
         p = 2222
@@ -1910,7 +1909,7 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         def on_confirm(yes):
             if not yes:
                 return
-            self._kill_vm_process(vm["_name"])
+            self._kill_vm_process(vm["_name"], pretty=vm["_pretty"])
             GLib.timeout_add(2500, self._refresh)
         self._confirm(
             S["dlg_stop_t"].format(vm["_pretty"]),
