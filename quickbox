@@ -215,6 +215,11 @@ _EN_STRINGS = {
     "btn_stop": "Stop VM",           "btn_launch": "Launch VM",
     "dlg_stop_t": "Stop '{}'?",
     "dlg_stop_b": "The VM will be shut down immediately.",
+    "btn_force_stop": "Force Stop",
+    "tt_force_stop": "The VM didn't respond to a graceful shutdown request — kill it immediately",
+    "dlg_force_stop_t": "Force stop '{}'?",
+    "dlg_force_stop_b": "The VM did not respond to a graceful shutdown request and will be killed immediately.\n\nAny unsaved data inside the guest will be lost.",
+    "ntf_stop_stalled": "'{}' did not stop — open quickbox to Force Stop it",
     "info_guest_os": "Guest OS",     "info_boot_mode": "Boot mode",
     "info_ssh_port": "SSH port",     "info_disk": "Disk",
     "info_iso": "ISO",
@@ -558,11 +563,32 @@ def read_vm_conf(path):
     return vm
 
 
-def is_running(vmname):
+def get_vm_pids(vmname):
     r = subprocess.run(["pgrep", "-fa", "qemu-system"],
                        capture_output=True, text=True)
     needle = f"name {vmname},process={vmname}"
-    return needle in r.stdout
+    pids = []
+    for line in r.stdout.splitlines():
+        if needle in line:
+            try:
+                pids.append(int(line.split()[0]))
+            except ValueError:
+                pass
+    return pids
+
+
+def is_running(vmname):
+    return bool(get_vm_pids(vmname))
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def fmt_size(n):
@@ -749,6 +775,8 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         self._timeout_handlers = []
         self._indicator = None
         self._transients = []
+        self._stop_escalated = set()      # VM names whose graceful stop timed out
+        self._stop_pending_check = set()  # VM names with a stall-check timer in flight
         self._build_css()
         self._build_ui()
         self._refresh()
@@ -816,16 +844,51 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         except Exception:
             return False
 
-    def _kill_vm_process(self, name):
+    STOP_GRACE_MS = 15000  # how long to wait for ACPI shutdown before offering Force Stop
+
+    def _kill_vm_process(self, name, force=False):
         import signal as _signal
-        needle = f"name {name},process={name}"
-        r = subprocess.run(["pgrep", "-fa", "qemu-system"], capture_output=True, text=True)
-        for line in r.stdout.splitlines():
-            if needle in line:
-                try:
-                    os.kill(int(line.split()[0]), _signal.SIGTERM)
-                except (ValueError, ProcessLookupError, PermissionError):
-                    pass
+        pids = get_vm_pids(name)
+        sig = _signal.SIGKILL if force else _signal.SIGTERM
+        all_signaled = True
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                all_signaled = False
+        if force:
+            if all_signaled:
+                self._stop_escalated.discard(name)
+        elif pids and name not in self._stop_pending_check:
+            # SIGTERM only requests an ACPI shutdown; guests with no ACPI
+            # handler (e.g. live/installer ISO sessions) never react to it.
+            # If the original process is still alive after a grace period,
+            # offer Force Stop instead of silently escalating to SIGKILL.
+            self._stop_pending_check.add(name)
+            GLib.timeout_add(self.STOP_GRACE_MS, self._check_stop_stalled, name, pids)
+
+    def _check_stop_stalled(self, name, pids):
+        self._stop_pending_check.discard(name)
+        if any(_pid_alive(p) for p in pids):
+            self._stop_escalated.add(name)
+            if self.current_vm and self.current_vm["_name"] == name:
+                self._show_panel(self.current_vm)
+            else:
+                notify("quickbox", S["ntf_stop_stalled"].format(name), "normal")
+        return False
+
+    def _force_stop_vm(self, vm):
+        def on_confirm(yes):
+            if not yes:
+                return
+            self._kill_vm_process(vm["_name"], force=True)
+            GLib.timeout_add(1000, self._refresh)
+        self._confirm_danger(
+            S["dlg_force_stop_t"].format(vm["_pretty"]),
+            S["dlg_force_stop_b"], on_confirm,
+            yes_label=S["btn_force_stop"], no_label=S["btn_confirm_no"])
 
     def _stop_vm_by_name(self, name):
         def on_confirm(yes):
@@ -1151,6 +1214,9 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         while row := self.listbox.get_first_child():
             self.listbox.remove(row)
         self.vms = get_vms(self.vms_dir)
+        if self._stop_escalated:
+            still_running = {v["_name"] for v in self.vms if v["_running"]}
+            self._stop_escalated &= still_running
         used = {int(v["ssh_port"]) for v in self.vms
                 if v.get("ssh_port") and v["ssh_port"].isdigit()}
         p = 2222
@@ -1296,6 +1362,12 @@ class QuickboxWindow(Gtk.ApplicationWindow):
             stop_btn = Gtk.Button(label=S["btn_stop"])
             stop_btn.connect("clicked", lambda b: self._stop_vm(vm))
             launch_box.append(stop_btn)
+            if vm["_name"] in self._stop_escalated:
+                force_btn = Gtk.Button(label=S["btn_force_stop"])
+                force_btn.set_tooltip_text(S["tt_force_stop"])
+                force_btn.add_css_class("destructive-action")
+                force_btn.connect("clicked", lambda b: self._force_stop_vm(vm))
+                launch_box.append(force_btn)
         else:
             launch_btn = Gtk.Button(label=S["btn_launch"])
             launch_btn.add_css_class("launch-btn")
@@ -3627,7 +3699,7 @@ class QuickboxWindow(Gtk.ApplicationWindow):
                 callback(False)
         dlg.choose(self, None, _on_response)
 
-    def _confirm_danger(self, title, body, callback):
+    def _confirm_danger(self, title, body, callback, yes_label=None, no_label=None):
         win = Gtk.Window()
         win.set_title("Quickbox")
         win.set_transient_for(self); self._track(win)
@@ -3656,10 +3728,10 @@ class QuickboxWindow(Gtk.ApplicationWindow):
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         btn_box.set_halign(Gtk.Align.END)
 
-        yes_btn = Gtk.Button(label=S["btn_delete_orig"])
+        yes_btn = Gtk.Button(label=yes_label or S["btn_delete_orig"])
         yes_btn.add_css_class("destructive-action")
 
-        no_btn = Gtk.Button(label=S["btn_keep"])
+        no_btn = Gtk.Button(label=no_label or S["btn_keep"])
         win.set_default_widget(no_btn)
 
         def _done(result):
